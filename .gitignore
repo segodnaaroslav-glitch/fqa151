@@ -1,0 +1,6 @@
+build/
+dist/
+*.spec
+__pycache__/
+mm2pricer_log.txt
+mm2pricer_config.json

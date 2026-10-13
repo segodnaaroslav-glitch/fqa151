@@ -1,0 +1,25 @@
+{
+  "_comment": "Скопируйте этот файл рядом с MM2Pricer.exe под именем mm2pricer_config.json и оставьте только то, что хотите поменять. Ключи, начинающиеся с _, игнорируются.",
+  "login_url": "https://dreampets.gg/mm2",
+  "site_domain": "dreampets.gg",
+  "items_api": "https://mm2.dreampets.gg/api/items/v1/items/user",
+  "profile_api": "https://auth.dreampets.gg/api/auth/v1/users/profile",
+  "sales_api": "https://mm2.dreampets.gg/api/sales/v1/sales/",
+  "sales_user_api": "https://mm2.dreampets.gg/api/sales/v1/sales/user",
+  "sales_best_api": "https://mm2.dreampets.gg/api/sales/v1/sales/best",
+  "currency": "rub",
+  "min_listing_price": 2.0,
+  "undercut": 0.01,
+  "top_n": 5,
+  "workers": 10,
+  "inventory_statuses": [
+    "in_inventory",
+    "on_sale"
+  ],
+  "on_sale_statuses": [
+    "on_sale"
+  ],
+  "dry_run": false,
+  "browser_path": "",
+  "auth_timeout_s": 900
+}

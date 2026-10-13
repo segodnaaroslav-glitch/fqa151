@@ -1,0 +1,40 @@
+name: Build MM2Pricer.exe
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt
+      - name: Unit tests
+        run: python tests/test_units.py
+      - name: End-to-end tests (mock site, real Chrome)
+        run: python tests/run_e2e.py
+
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt pyinstaller==6.22.3
+      - name: Build exe
+        run: python -m PyInstaller --onefile --console --name MM2Pricer mm2_pricer.py
+      - name: Smoke test
+        run: .\dist\MM2Pricer.exe --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MM2Pricer
+          path: |
+            dist/MM2Pricer.exe
+            mm2pricer_config.example.json
+            README.md
