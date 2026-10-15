@@ -49,7 +49,10 @@ def run(name, variant, transport="auto", dry_run=False):
                          "--host-resolver-rules=MAP *.dreampets.test 127.0.0.1"],
         "auth_timeout_s": 60,
     }
-    tmp = tempfile.mkdtemp(prefix="mm2e2e-")
+    logs = os.environ.get("MM2_E2E_LOGS")
+    if logs:
+        os.makedirs(logs, exist_ok=True)
+    tmp = tempfile.mkdtemp(prefix=f"mm2e2e-{name.replace('/', '-')}-", dir=logs or None)
     cfg_path = os.path.join(tmp, "config.json")
     log_path = os.path.join(tmp, "log.txt")
     with open(cfg_path, "w", encoding="utf-8") as f:

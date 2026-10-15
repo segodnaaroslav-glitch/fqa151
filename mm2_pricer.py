@@ -750,7 +750,7 @@ class Browser:
         ]
         log(f"Запуск браузера: {exe}, порт {self.port}")
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        deadline = time.time() + 25
+        deadline = time.time() + 45
         while time.time() < deadline:
             try:
                 info = self.http.get(f"{self.base}/json/version", timeout=2).json()
@@ -1173,12 +1173,15 @@ class Api:
             if current != url:                       # другой поток уже нашёл новый адрес
                 return self._send(method, current, params, body)
             # ищем заново раз в минуту или сразу, как сайт сделал новые запросы
+            # ищем заново, как только сайт сделал новые запросы; если в прошлый раз
+            # вариантов не было вовсе (код сайта ещё грузился) — через 5 с, иначе через минуту
             seen = len(self.browser.observed)
-            last_at, last_seen = self._discover_at.get(key, (0, -1))
-            if time.time() - last_at < 60 and seen == last_seen:
+            last_at, last_seen, last_found = self._discover_at.get(key, (0, -1, 0))
+            if seen == last_seen and time.time() - last_at < (60 if last_found else 5):
                 return status, data
-            self._discover_at[key] = (time.time(), seen)
-            for cand in endpoint_alternatives(url, self.known_paths(), self.browser.domain)[:4]:
+            cands = endpoint_alternatives(url, self.known_paths(), self.browser.domain)[:4]
+            self._discover_at[key] = (time.time(), seen, len(cands))
+            for cand in cands:
                 st, dt = self._send(method, cand, params, body)
                 if st != 404:
                     self.endpoints[key] = cand
@@ -1186,6 +1189,10 @@ class Api:
                     log(f"Новый адрес {key}: {cand}")
                     return st, dt
         return status, data
+
+    def reset_discovery(self):
+        with self._discover_lock:
+            self._discover_at.clear()
 
     def known_paths(self) -> list[str]:
         """Адреса API из кода сайта и из запросов, которые делал сам сайт."""
@@ -1422,6 +1429,7 @@ def items_seen_by_site(captured: list[dict]) -> list[tuple[str, list]]:
 def load_inventory(api: Api, browser: Browser, cfg: dict):
     """Весь инвентарь и все ваши активные лоты."""
     print("Сканирую инвентарь...")
+    api.reset_discovery()   # страница уже загрузилась — прежние неудачные поиски не в счёт
     items_error = None
     try:
         raw_items = expand_items(api.get_list("items_api", "items", "items"))
