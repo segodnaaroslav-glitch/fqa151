@@ -10,8 +10,14 @@ variant="new":  «обновлённый» сайт — токен только 
 variant="new2": как "new", но старый адрес предметов отдаёт только выставленные,
                 а инвентарь (сгруппированный «товар ×N») сайт берёт с другого адреса —
                 и только на странице «Продажа».
+variant="market": как на настоящем сайте после обновления — два маркета.
+                Старый (api.*, API v1) и новый (mkt.*: inventory/v1 и market/v1, как в
+                логе с dreampets.gg). Адреса выставления/снятия и лотов товара на новом
+                маркете программе заранее не известны: «пользователь» (код страницы)
+                один раз сам открывает товар, выставляет предмет и снимает его.
 """
 import json
+import re
 import secrets
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -50,6 +56,72 @@ def initial_state(variant):
     }
 
 
+def initial_market_state():
+    acc = {"acc1": {"name": "Ssob_indra", "tradable": True}, "acc2": {"name": "bruh", "tradable": False}}
+    products = {"N1": "Bauble", "N2": "Bunnies", "N3": "Candy", "N4": "Lonely", "PX": "Demo"}
+    inv = {"n1": ("N1", "acc1"), "n2": ("N1", "acc1"), "n3": ("N2", "acc1"), "n4": ("N3", "acc1"),
+           "n5": ("N3", "acc2"), "n6": ("N4", "acc1"), "n7": ("N2", "acc1")}
+    sales = {"ns3": {"product": "N2", "item": "n3", "price": 50.00, "user": "U1", "account": "acc1"}}
+    market = {"N1": [20.00, 21.00, 22.00, 23.00, 24.00, 25.00], "N2": [40.00, 41.00, 42.00, 43.00, 44.00],
+              "N3": [5.00, 5.10], "PX": [7.00, 8.00]}
+    n = 0
+    for pid, prices in market.items():
+        for price in prices:
+            n += 1
+            sales[f"x{n}"] = {"product": pid, "item": f"other{n}", "price": price, "user": "U9"}
+    return {"accounts": acc, "products": products,
+            "inventory": {k: {"product": v[0], "account": v[1]} for k, v in inv.items()},
+            "sales": sales,
+            # старый маркет: один предмет, выставлен по 2.00, конкуренты тоже по 2.00
+            "old_items": {"o1": {"product": "OLD1", "name": "Starfish", "status": "on_sale"}},
+            "old_sales": {"os1": {"item": "o1", "price": 2.0}},
+            "old_market": [2.0] * 6}
+
+
+MARKET_APP_JS = """
+const ROOT = location.host.replace(/^www\\./, '');
+const API = location.protocol + '//api.' + ROOT, MKT = location.protocol + '//mkt.' + ROOT;
+let token = null, uid = null;
+async function call(base, path, opts = {}) {
+  opts.credentials = 'include';
+  opts.headers = Object.assign({}, opts.headers || {});
+  if (token) opts.headers.Authorization = 'Bearer ' + token;
+  const r = await fetch(base + path, opts);
+  return r.status === 204 ? null : r.json();
+}
+async function ensureLogin() {
+  const t = await call(API, '/api/auth/v2/token');
+  if (t.token) { token = t.token; return; }
+  await new Promise(r => setTimeout(r, 2000));            // «пользователь» входит
+  await call(API, '/api/auth/v2/session', {method: 'POST'});
+  token = (await call(API, '/api/auth/v2/token')).token;
+}
+async function runDemo() {                                  // «пользователь» показывает выставление
+  await call(MKT, '/api/market/v1/market/products?search=&currency=rub&limit=72&offset=0');
+  await call(MKT, '/api/market/v1/market/products/PX/sales?currency=rub&sort=price_asc&limit=20');
+  const sale = await call(MKT, '/api/market/v1/sales', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({account_id: 'acc1', item_id: 'n6', price: '99.99', currency: 'rub'})});
+  await call(MKT, `/api/market/v1/users/${uid}/sales`);
+  await call(MKT, '/api/market/v1/sales/' + sale.id, {method: 'DELETE'});
+  await call(MKT, `/api/market/v1/users/${uid}/sales`);
+}
+(async () => {
+  await ensureLogin();
+  uid = (await call(API, '/api/auth/v2/users/profile')).user_id;
+  if (location.pathname.endsWith('/sell')) {
+    await call(MKT, `/api/inventory/v1/users/${uid}/items`);
+    await call(MKT, `/api/inventory/v1/users/${uid}/account-inventory-gates`);
+    await call(MKT, `/api/market/v1/users/${uid}/sales`);
+    const demo = await call(MKT, '/mock/demo');
+    if (demo.run) setTimeout(runDemo, 4000);
+  } else {
+    await call(MKT, '/api/market/v1/market/products?search=&currency=rub&sort=popularity_desc&limit=72&offset=0');
+  }
+})();
+"""
+
+
 OLD_PAGE = """<!doctype html><html><head><title>DreamPets (old)</title></head><body>
 <h1>dreampets mock (old)</h1><div id="who">не вошли</div>
 <script src="/static/app.js"></script></body></html>"""
@@ -78,7 +150,7 @@ const API = location.protocol + '//api.' + location.host.replace(/^www\\./, '');
 const ROUTES = {
   session: '/api/auth/v2/session', token: '/api/auth/v2/token',
   profile: '/api/auth/v2/users/profile', items: '/api/items/v2/items/user',
-  inventory: '/api/inventory/v2/accounts/items',
+  inventory: '/api/items/v2/accounts/items',
   sales: '/api/sales/v2/sales/', mySales: '/api/sales/v2/sales/user',
   best: '/api/sales/v2/sales/best',
 };
@@ -110,9 +182,10 @@ async function ensureLogin() {
 
 
 class MockSite:
-    def __init__(self, variant: str, host: str = "127.0.0.1"):
+    def __init__(self, variant: str, host: str = "127.0.0.1", demo: bool = True):
         self.variant = variant
-        self.state = initial_state(variant)
+        self.state = initial_market_state() if variant == "market" else initial_state(variant)
+        self.demo = demo
         self.lock = threading.Lock()
         self.tokens = set()
         self.sessions = {}
@@ -170,8 +243,13 @@ class MockSite:
         if path in ("/mm2", "/mm2/sell", "/mm2/items"):
             return h._send(200, OLD_PAGE if self.variant == "old" else NEW_PAGE, "text/html; charset=utf-8")
         if path == "/static/app.js":
-            js = OLD_APP_JS if self.variant == "old" else NEW_APP_JS % (self.variant, CLIENT_VERSION)
+            if self.variant == "market":
+                js = MARKET_APP_JS
+            else:
+                js = OLD_APP_JS if self.variant == "old" else NEW_APP_JS % (self.variant, CLIENT_VERSION)
             return h._send(200, js, "application/javascript")
+        if self.variant == "market":
+            return self.market_api(h, method, path, q, body)
         if self.variant == "old":
             return self.old_api(h, method, path, q, body)
         return self.new_api(h, method, path, q, body)
@@ -243,7 +321,7 @@ class MockSite:
             chunk = ids[(page - 1) * limit: page * limit]
             return h._send(200, {"data": {"items": [self.item_view(i, old=False) for i in chunk],
                                           "total": len(ids), "page": page, "limit": limit}})
-        if path == "/api/inventory/v2/accounts/items":
+        if path == "/api/items/v2/accounts/items":
             groups = {}
             for iid, it in self.state["items"].items():
                 if it["status"] == "on_sale":
@@ -324,7 +402,111 @@ class MockSite:
                 self.state["items"][s["item"]]["status"] = self.state["inv_status"]
         return h._send(204, None)
 
+    # ---------- вариант market: два маркета ----------
+
+    def market_api(self, h, method, path, q, body):
+        host = h.headers.get("Host", "")
+        st = self.state
+        if host.startswith("api."):
+            if path == "/api/auth/v2/session" and method == "POST":
+                sid = secrets.token_urlsafe(12)
+                self.sessions[sid] = True
+                return h._send(200, {"ok": True},
+                               headers={"Set-Cookie": f"sid={sid}; Path=/; HttpOnly; SameSite=Lax"})
+            if path == "/api/auth/v2/token":
+                cookie = h.headers.get("Cookie", "")
+                sid = dict(p.strip().split("=", 1) for p in cookie.split(";") if "=" in p).get("sid")
+                if sid not in self.sessions:
+                    return h._send(401, {"error": "no session"})
+                return h._send(200, {"token": self._new_token()})
+            if self._bearer(h) not in self.tokens:
+                return h._send(403, {"detail": "Not authenticated"})
+            if path == "/api/auth/v2/users/profile":
+                return h._send(200, {"user_id": "U1", "username": "tester", "email": "t.e.s.t@mail.ru"})
+            if path == "/api/items/v1/items/user":
+                return h._send(200, {"items": [
+                    {"item_id": iid, "status": it["status"],
+                     "product": {"product_id": it["product"], "name": it["name"]}}
+                    for iid, it in st["old_items"].items()]})
+            if path == "/api/sales/v1/sales/user":
+                return h._send(200, {"sales": [{"sale_id": sid, "item_id": x["item"], "price": x["price"]}
+                                               for sid, x in st["old_sales"].items()]})
+            if path == "/api/sales/v1/sales/best":
+                if q.get("product_id") != "OLD1":
+                    return h._send(400, {"detail": "The product does not exist."})
+                rows = [{"sale_id": f"om{i}", "price": p} for i, p in enumerate(st["old_market"])]
+                rows += [{"sale_id": sid, "price": x["price"]} for sid, x in st["old_sales"].items()]
+                rows.sort(key=lambda r: r["price"])
+                return h._send(200, {"sales": rows[:int(q.get("count", 5))]})
+            return h._send(404, {"detail": "Not Found"})
+
+        if not host.startswith("mkt."):
+            return h._send(404, {"detail": "Not Found"})
+        if path == "/mock/demo":
+            run = self.demo
+            self.demo = False
+            return h._send(200, {"run": run})
+        if self._bearer(h) not in self.tokens:
+            return h._send(403, {"detail": "Not authenticated"})
+        on_sale = {x["item"] for x in st["sales"].values() if x.get("user") == "U1"}
+        if path == "/api/inventory/v1/users/U1/items":
+            return h._send(200, {"items": [
+                {"id": iid, "user_id": "U1", "account_id": it["account"], "product_id": it["product"],
+                 "product": {"id": it["product"], "name": st["products"][it["product"]]}}
+                for iid, it in st["inventory"].items()]})
+        if path == "/api/inventory/v1/users/U1/account-inventory-gates":
+            return h._send(200, {"gates": [
+                {"account_id": aid, "account": {"roblox_display_name": a["name"]}, "tradable": a["tradable"]}
+                for aid, a in st["accounts"].items()]})
+        if path == "/api/market/v1/users/U1/sales":
+            return h._send(200, {"sales": [self._mkt_sale(sid, x) for sid, x in st["sales"].items()
+                                           if x.get("user") == "U1"]})
+        if path == "/api/market/v1/market/products":
+            return h._send(200, {"products": [{"product_id": pid, "name": n} for pid, n in st["products"].items()]})
+        m = re.fullmatch(r"/api/market/v1/market/products/([^/]+)/sales", path)
+        if m and method == "GET":
+            if m.group(1) not in st["products"]:
+                return h._send(404, {"detail": "Product not found"})
+            rows = sorted((self._mkt_sale(sid, x) for sid, x in st["sales"].items()
+                           if x["product"] == m.group(1)), key=lambda r: float(r["price"]))
+            return h._send(200, {"sales": rows[:int(q.get("limit", 20))], "total": len(rows)})
+        if path == "/api/market/v1/sales" and method == "POST":
+            with self.lock:
+                it = st["inventory"].get(body.get("item_id"))
+                if not it or body.get("account_id") != it["account"]:
+                    return h._send(400, {"detail": "Item not found"})
+                if not st["accounts"][it["account"]]["tradable"]:
+                    return h._send(400, {"detail": "Account is frozen"})
+                if body["item_id"] in on_sale:
+                    return h._send(409, {"detail": "Item is already on sale"})
+                if not isinstance(body.get("price"), str):
+                    return h._send(422, {"detail": [{"loc": ["body", "price"], "type": "string_type"}]})
+                sid = "ms" + secrets.token_hex(3)
+                st["sales"][sid] = {"product": it["product"], "item": body["item_id"],
+                                    "price": float(body["price"]), "user": "U1", "account": it["account"]}
+            return h._send(201, self._mkt_sale(sid, st["sales"][sid]))
+        m = re.fullmatch(r"/api/market/v1/sales/([^/]+)", path)
+        if m and method == "DELETE":
+            with self.lock:
+                x = st["sales"].get(m.group(1))
+                if not x or x.get("user") != "U1":
+                    return h._send(404, {"detail": "Sale not found"})
+                del st["sales"][m.group(1)]
+            return h._send(204, None)
+        return h._send(404, {"detail": "Not Found"})
+
+    @staticmethod
+    def _mkt_sale(sid, x):
+        return {"id": sid, "user_id": x.get("user"), "account_id": x.get("account"), "item_id": x["item"],
+                "product_id": x["product"], "price": f"{x['price']:.2f}", "currency": "rub",
+                "status": "available"}
+
     def my_prices(self):
         """item_id -> цена активного лота пользователя (для проверки результата)."""
+        if self.variant == "market":
+            st = self.state
+            out = {x["item"]: x["price"] for x in st["old_sales"].values()}
+            out.update({x["item"]: x["price"] for x in st["sales"].values() if x.get("user") == "U1"})
+            return out
         return {s["item"]: s["price"] for s in self.state["sales"].values()
                 if s.get("mine") and s.get("status") != "sold"}

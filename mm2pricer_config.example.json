@@ -39,6 +39,11 @@
     "escrow"
   ],
   "learn_from_site": true,
+  "new_market": true,
+  "inventory_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/items",
+  "inventory_gates_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/account-inventory-gates",
+  "market_sales_user_api": "https://mm2-test.dreampets.gg/api/market/v1/users/{user_id}/sales",
+  "teach_timeout_s": 900,
   "dry_run": false,
   "browser_path": "",
   "auth_timeout_s": 900

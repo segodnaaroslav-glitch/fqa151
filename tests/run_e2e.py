@@ -22,10 +22,14 @@ BROWSER = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MM2_BROWSER", ""
 # i6 продан, i7 под трейд-локом — их выставлять нельзя
 EXPECTED = {"i1": 13.99, "i2": 13.99, "i3": 2.0, "i4": 9.99, "i5": 4.99, "i8": 3.39, "i9": 3.39}
 INITIAL = {"i1": 15.0, "i4": 9.99, "i5": 4.99}
+# два маркета: старый o1 уже по 2.00; на новом n5 — с замороженного аккаунта,
+# у n6 нет конкурентов — их не выставляем
+EXPECTED_MARKET = {"o1": 2.0, "n1": 23.99, "n2": 23.99, "n3": 43.99, "n7": 43.99, "n4": 5.09}
+LEARNED = os.path.join(tempfile.mkdtemp(prefix="mm2e2e-learned-"), "learned.json")
 
 
-def run(name, variant, transport="auto", dry_run=False):
-    site = MockSite(variant)
+def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text=""):
+    site = MockSite(variant, demo=demo)
     p = site.port
     if variant == "old":
         page, api = f"http://127.0.0.1:{p}", f"http://127.0.0.1:{p}"
@@ -42,13 +46,26 @@ def run(name, variant, transport="auto", dry_run=False):
         "sales_api": f"{api}/api/sales/v1/sales/",
         "sales_user_api": f"{api}/api/sales/v1/sales/user",
         "sales_best_api": f"{api}/api/sales/v1/sales/best",
+        # нового маркета в этих вариантах нет — и в настоящий сайт не ходим
+        "inventory_api": f"{api}/api/none/{{user_id}}/items",
+        "inventory_gates_api": f"{api}/api/none/{{user_id}}/gates",
+        "market_sales_user_api": f"{api}/api/none/{{user_id}}/sales",
         "transport": transport,
         "dry_run": dry_run,
         "browser_path": BROWSER,
         "browser_args": ["--headless=new", "--no-sandbox", "--no-proxy-server",
                          "--host-resolver-rules=MAP *.dreampets.test 127.0.0.1"],
         "auth_timeout_s": 60,
+        "teach_timeout_s": 60,
     }
+    if variant == "market":
+        mkt = f"http://mkt.dreampets.test:{p}"
+        cfg.update({
+            "profile_api": f"{api}/api/auth/v2/users/profile",
+            "inventory_api": f"{mkt}/api/inventory/v1/users/{{user_id}}/items",
+            "inventory_gates_api": f"{mkt}/api/inventory/v1/users/{{user_id}}/account-inventory-gates",
+            "market_sales_user_api": f"{mkt}/api/market/v1/users/{{user_id}}/sales",
+        })
     logs = os.environ.get("MM2_E2E_LOGS")
     if logs:
         os.makedirs(logs, exist_ok=True)
@@ -59,15 +76,16 @@ def run(name, variant, transport="auto", dry_run=False):
         json.dump(cfg, f)
     print(f"\n===== {name} =====", flush=True)
     proc = subprocess.run(
-        [sys.executable, "-I", PRICER, "--config", cfg_path, "--log", log_path, "--no-pause"],
-        capture_output=True, text=True, encoding="utf-8", timeout=180,
+        [sys.executable, "-I", PRICER, "--config", cfg_path, "--log", log_path, "--no-pause",
+         "--learned", LEARNED],
+        capture_output=True, text=True, encoding="utf-8", timeout=240,
     )
     print(proc.stdout + proc.stderr)
     site.stop()
     got = site.my_prices()
-    want = INITIAL if dry_run else EXPECTED
-    ok = got == want and "Ошибок: 0" in proc.stdout
-    if not dry_run:
+    want = EXPECTED_MARKET if variant == "market" else INITIAL if dry_run else EXPECTED
+    ok = got == want and "Ошибок: 0" in proc.stdout and expect_text in proc.stdout
+    if not dry_run and variant != "market":
         # лот на P4 уже стоял по нужной цене, у P3 нет конкурентов — их не трогаем
         ok = ok and "s5" in site.state["sales"] and "s4" in site.state["sales"]
     print(f"цены после запуска: {got}")
@@ -84,6 +102,10 @@ if __name__ == "__main__":
         "обновлённый сайт (статусы, страницы, account_id)": run("new/auto", "new"),
         "инвентарь только на странице «Продажа»": run("new2/auto", "new2"),
         "обновлённый сайт, тестовый режим": run("new/dry-run", "new", dry_run=True),
+        "два маркета: учусь выставлять у пользователя": run(
+            "market/teach", "market", expect_text="Запомнил, как выставлять"),
+        "два маркета: по запомненному, без показа": run(
+            "market/saved", "market", demo=False, expect_text="как запомнил раньше"),
     }
     print("\n===== ИТОГ =====")
     for k, v in results.items():

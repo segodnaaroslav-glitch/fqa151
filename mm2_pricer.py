@@ -68,7 +68,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -98,6 +98,14 @@ DEFAULT_CONFIG = {
                           "process", "wait", "refund", "expire", "remov", "escrow"],
     # открыть страницу «Продажа» и взять инвентарь так, как его видит сайт
     "learn_from_site": True,
+
+    # новый маркет ({user_id} подставляется из профиля)
+    "new_market": True,
+    "inventory_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/items",
+    "inventory_gates_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/account-inventory-gates",
+    "market_sales_user_api": "https://mm2-test.dreampets.gg/api/market/v1/users/{user_id}/sales",
+    # сколько ждать, пока вы один раз покажете выставление на новом маркете
+    "teach_timeout_s": 900,
 
     "dry_run": False,
     # auto — через вкладку браузера, при неудаче напрямую; browser; requests
@@ -131,6 +139,7 @@ def app_dir() -> str:
 
 CONFIG_PATH = os.path.join(app_dir(), "mm2pricer_config.json")
 LOG_PATH = os.path.join(app_dir(), "mm2pricer_log.txt")
+LEARNED_PATH = os.path.join(app_dir(), "mm2pricer_learned.json")
 
 
 def load_config(path: str) -> dict:
@@ -161,9 +170,12 @@ _log_file = None
 _log_lock = threading.Lock()
 
 
+_EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
 def redact(text: str) -> str:
     text = _TOKEN_FIELD_RE.sub(r'\1"<token>"', _JWT_RE.sub("<token>", text))
-    return _BEARER_RE.sub(r"\1<token>", text)
+    return _EMAIL_RE.sub("<email>", _BEARER_RE.sub(r"\1<token>", text))
 
 
 def open_log(path: str):
@@ -267,12 +279,14 @@ def norm_sale(raw) -> dict | None:
     sale_id = first(raw, "sale_id", "saleId", "id", "_id")
     if sale_id is None:
         return None
+    seller = raw.get("seller") if isinstance(raw.get("seller"), dict) else {}
     return {
         "sale_id": sale_id,
         "item_id": first(raw, "item_id", "itemId") or first(item, "item_id", "itemId", "id", "_id"),
         "product_id": first(raw, "product_id", "productId") or first(product, "product_id", "productId", "id"),
         "price": to_price(first(raw, "price", "amount", "cost")),
         "status": str(raw.get("status") or raw.get("state") or "").strip().lower(),
+        "user_id": first(raw, "user_id", "userId", "seller_id", "sellerId") or first(seller, "user_id", "id"),
     }
 
 
@@ -446,8 +460,7 @@ def find_field(raw: dict, name: str):
     return None
 
 
-def profile_name(body) -> str | None:
-    """Ник (или id) из ответа профиля; None — если это не профиль."""
+def _profile_user(body) -> dict | None:
     if not isinstance(body, dict):
         return None
     data = body.get("data")
@@ -455,10 +468,24 @@ def profile_name(body) -> str | None:
     if isinstance(data, dict):
         variants.append(data.get("user"))
     for v in variants:
-        uid = first(v, "user_id", "userId", "id", "_id", "uid")
-        if uid is not None:
-            return str(first(v, "username", "name", "nickname", "login", "display_name") or uid)
+        if first(v, "user_id", "userId", "id", "_id", "uid") is not None:
+            return v
     return None
+
+
+def profile_name(body) -> str | None:
+    """Ник (или id) из ответа профиля; None — если это не профиль."""
+    user = _profile_user(body)
+    if user is None:
+        return None
+    uid = first(user, "user_id", "userId", "id", "_id", "uid")
+    return str(first(user, "username", "name", "nickname", "login", "display_name") or uid)
+
+
+def profile_uid(body) -> str | None:
+    user = _profile_user(body)
+    uid = first(user, "user_id", "userId", "id", "_id", "uid") if user else None
+    return None if uid is None else str(uid)
 
 
 _TOKEN_KEY_RE = re.compile(r"access.?token|^token$|jwt|auth.?token|id.?token", re.I)
@@ -710,6 +737,7 @@ class Browser:
         self.observed = {}                   # (method, url без query) -> status
         self.captured = []                   # ответы API, которые получил сам сайт
         self._body_threads = []
+        self._seq = 0
         self.last_api_event = time.time()
         self._cookie_cache = {}
         self._ua = None
@@ -851,7 +879,10 @@ class Browser:
                 return
             if p.get("type") not in ("XHR", "Fetch") and "/api/" not in url:
                 return
-            self._req_meta[rid] = [req.get("method", "GET"), url, None, ""]
+            self._seq += 1
+            # [метод, адрес, статус, тип ответа, тело запроса, есть ли тело, порядковый номер]
+            self._req_meta[rid] = [req.get("method", "GET"), url, None, "", req.get("postData"),
+                                   bool(req.get("hasPostData")), self._seq]
             self.last_api_event = time.time()
             self._remember_headers(url, req.get("headers") or {})
         elif method == "Network.requestWillBeSentExtraInfo":
@@ -868,26 +899,41 @@ class Browser:
             meta = self._req_meta.get(rid)
             if meta:
                 self.last_api_event = time.time()
-                if "json" in meta[3] or not meta[3]:
+                if "json" in meta[3] or not meta[3] or meta[0] != "GET":
                     # тело ответа сайта — чтобы увидеть, откуда сайт берёт инвентарь.
                     # Запрашиваем в отдельном потоке: этот поток читает ответы CDP.
                     t = threading.Thread(target=self._grab_body, args=(sess, rid, list(meta)), daemon=True)
                     self._body_threads.append(t)
                     t.start()
+        elif method == "Network.loadingFailed":
+            # так бывает с ответом 204 без тела, если страница его не дочитала:
+            # ответ получен, запрос выполнен — для изменяющих запросов это важно
+            meta = self._req_meta.get(rid)
+            if meta and meta[2] is not None and meta[0] != "GET":
+                self.last_api_event = time.time()
+                t = threading.Thread(target=self._grab_body, args=(sess, rid, list(meta)), daemon=True)
+                self._body_threads.append(t)
+                t.start()
 
     def _grab_body(self, sess: CDPSession, rid: str, meta: list):
+        post = meta[4]
+        if post is None and meta[5]:
+            try:
+                post = sess.call("Network.getRequestPostData", {"requestId": rid}, timeout=10).get("postData")
+            except Exception:
+                post = None
         try:
             res = sess.call("Network.getResponseBody", {"requestId": rid}, timeout=15)
-        except Exception:
-            return
-        body = res.get("body", "")
-        if res.get("base64Encoded"):
-            try:
+            body = res.get("body", "")
+            if res.get("base64Encoded"):
                 body = base64.b64decode(body).decode("utf-8", "replace")
-            except Exception:
+        except Exception:
+            body = ""          # например, 204 без тела
+            if meta[0] == "GET":
                 return
         if len(body) <= 5_000_000:
-            self.captured.append({"method": meta[0], "url": meta[1], "status": meta[2], "body": body})
+            self.captured.append({"method": meta[0], "url": meta[1], "status": meta[2], "body": body,
+                                  "post": post, "seq": meta[6]})
 
     def wait_quiet(self, min_s: float, quiet_s: float, max_s: float):
         """Ждёт, пока сайт перестанет делать запросы к API."""
@@ -1098,6 +1144,7 @@ class Api:
         self._discover_lock = threading.Lock()
         self._discover_at = {}
         self.extra_fields = set()            # поля, которые сайт требует при выставлении
+        self.user_id = None
 
     # --- транспорт ---
 
@@ -1144,13 +1191,17 @@ class Api:
                 log(f"{how}: {method} {url}: {e}")
         raise RuntimeError(f"нет связи с сайтом ({short(last)})")
 
-    def _send(self, method, url, params=None, body=None, timeout=20):
+    def _send(self, method, url, params=None, body=None, timeout=20, raw: str | None = None):
         full = add_params(url, params)
         headers = self.headers_for(url)
         data = None
         if body is not None:
             data = json.dumps(body)
             headers["content-type"] = "application/json"
+        elif raw is not None:
+            data = raw
+            headers["content-type"] = ("application/json" if raw.lstrip()[:1] in "{["
+                                       else "application/x-www-form-urlencoded")
         for attempt in range(4):
             status, text = self._transport(method, full, headers, data, timeout)
             retry = status == 429 or (method == "GET" and status in (502, 503, 504))
@@ -1360,6 +1411,7 @@ def detect_login(api: Api, browser: Browser, try_cookies: bool) -> str | None:
         status, body = api.request("GET", "profile_api")
         name = profile_name(body) if status == 200 else None
         if name:
+            api.user_id = profile_uid(body)
             log(f"Вход подтверждён через {cand[0]}, профиль {name}")
             return name
         if status in (404, 405) or (status == 200 and not name):
@@ -1426,22 +1478,469 @@ def items_seen_by_site(captured: list[dict]) -> list[tuple[str, list]]:
     return found
 
 
-def load_inventory(api: Api, browser: Browser, cfg: dict):
-    """Весь инвентарь и все ваши активные лоты."""
-    print("Сканирую инвентарь...")
-    api.reset_discovery()   # страница уже загрузилась — прежние неудачные поиски не в счёт
-    items_error = None
-    try:
-        raw_items = expand_items(api.get_list("items_api", "items", "items"))
-    except Exception as e:
-        # старый адрес не отвечает — попробуем взять инвентарь со страницы сайта
-        if not cfg["learn_from_site"]:
-            raise
-        items_error = e
-        raw_items = []
-        print(f"  Список предметов по старому адресу не получен ({short(e)}) — беру со страницы сайта.")
+# ---------- новый маркет: выставление «по образцу» ----------
+#
+# Адреса и формат запросов выставления/снятия на новом маркете в коде программы
+# не зашиты: программа один раз смотрит, как это делает сам сайт, когда вы
+# выставляете и снимаете предмет руками, и повторяет те же запросы для других
+# предметов и цен. Выученное хранится в mm2pricer_learned.json.
 
-    if cfg["learn_from_site"]:
+_PH_RE = re.compile(r"\{\{(\w+)\}\}")
+
+
+def _ok(status) -> bool:
+    return isinstance(status, int) and 200 <= status < 300
+
+
+def _subst_text(text: str, mapping: dict) -> str:
+    for name, value in sorted(mapping.items(), key=lambda kv: -len(str(kv[1] or ""))):
+        if value not in (None, ""):
+            text = text.replace(str(value), "{{%s}}" % name)
+    return text
+
+
+def _template_json(obj, mapping: dict, prices: list):
+    """Значения из mapping -> {{имя}}, поле цены -> {{price}} (его исходное значение — в prices)."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if ("price" in k.lower() and not isinstance(v, (bool, dict, list))
+                    and to_price(v) is not None):
+                prices.append(v)
+                out[k] = "{{price}}"
+            else:
+                out[k] = _template_json(v, mapping, prices)
+        return out
+    if isinstance(obj, list):
+        return [_template_json(v, mapping, prices) for v in obj]
+    if isinstance(obj, (str, int)) and not isinstance(obj, bool):
+        for name, value in mapping.items():
+            if value not in (None, "") and str(obj) == str(value):
+                return "{{%s}}" % name
+    return obj
+
+
+def _fill(obj, values: dict):
+    if isinstance(obj, dict):
+        return {k: _fill(v, values) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_fill(v, values) for v in obj]
+    if isinstance(obj, str):
+        m = _PH_RE.fullmatch(obj)
+        if m and m.group(1) in values:
+            return values[m.group(1)]
+        return _PH_RE.sub(lambda mm: str(values.get(mm.group(1), mm.group(0))), obj)
+    return obj
+
+
+def _make_template(cap: dict, mapping: dict) -> dict:
+    tpl = {"method": cap["method"], "url": _subst_text(cap["url"], mapping), "body": None, "kind": None}
+    post = cap.get("post")
+    if post:
+        prices = []
+        try:
+            tpl["body"], tpl["kind"] = _template_json(json.loads(post), mapping, prices), "json"
+        except ValueError:
+            tpl["body"], tpl["kind"] = _subst_text(post, mapping), "text"
+        if prices:
+            v = prices[0]
+            tpl["price_type"] = "str" if isinstance(v, str) else "num"
+            tpl["demo_price"] = to_price(v)
+    return tpl
+
+
+def _has(tpl: dict, name: str) -> bool:
+    return "{{%s}}" % name in tpl["url"] + json.dumps(tpl["body"], ensure_ascii=False)
+
+
+def _json_or_none(text):
+    try:
+        return json.loads(text) if text else None
+    except ValueError:
+        return None
+
+
+def _sales_in(body) -> list[dict]:
+    return [s for lst in dict_lists(body) for s in map(norm_sale, lst) if s and s["price"] is not None]
+
+
+def learn_market_ops(captured: list[dict], items_by_id: dict, product_ids: set, uid: str | None) -> dict:
+    """Ищет в запросах сайта: список лотов товара, выставление и снятие лота."""
+    caps = sorted(captured, key=lambda c: c.get("seq", 0))
+    ops = {}
+
+    # выставление: первый POST/PUT с id вашего предмета и полем цены
+    create_cap = demo = None
+    for cap in caps:
+        if cap["method"] not in ("POST", "PUT") or not _ok(cap["status"]):
+            continue
+        text = cap["url"] + "\n" + (cap.get("post") or "")
+        found = [i for i in items_by_id if i in text]
+        if len(found) != 1:
+            # выставили сразу несколько штук — по такому образцу повторять нельзя
+            if len(found) > 1:
+                log(f"Выставление сразу {len(found)} шт. — для образца нужно выставить одну")
+            continue
+        iid = found[0]
+        it = items_by_id[iid]
+        mapping = {"item_id": it["item_id"], "product_id": it["product_id"],
+                   "account_id": find_field(it["raw"], "account_id"), "user_id": uid}
+        tpl = _make_template(cap, mapping)
+        if tpl.get("price_type") and _has(tpl, "item_id"):
+            create_cap, demo = cap, it
+            # во сколько раз цена в запросе больше цены лота (копейки?)
+            tpl["price_scale"] = 1
+            demo_sale = next((s for later in caps if later.get("seq", 0) > cap.get("seq", 0)
+                              for s in _sales_in(_json_or_none(later["body"]))
+                              if str(s["item_id"]) == iid), None)
+            if demo_sale and demo_sale["price"] and tpl.get("demo_price"):
+                if 90 < tpl["demo_price"] / demo_sale["price"] < 110:
+                    tpl["price_scale"] = 100
+            ops["create"] = tpl
+            break
+
+    # снятие: следующий изменяющий запрос с id этого лота или предмета
+    if create_cap:
+        iid = str(demo["item_id"])
+        sale_ids = set()
+        created = _json_or_none(create_cap["body"])
+        for d in [created] + [x for lst in dict_lists(created) for x in lst]:
+            if isinstance(d, dict):
+                for k in ("sale_id", "saleId", "id"):
+                    if isinstance(d.get(k), (str, int)) and str(d[k]) != iid:
+                        sale_ids.add(str(d[k]))
+        for cap in caps:
+            for s in _sales_in(_json_or_none(cap["body"])):
+                if str(s["item_id"]) == iid:
+                    sale_ids.add(str(s["sale_id"]))
+        for cap in caps:
+            if (cap.get("seq", 0) <= create_cap.get("seq", 0) or cap["method"] == "GET"
+                    or not _ok(cap["status"])):
+                continue
+            text = cap["url"] + "\n" + (cap.get("post") or "")
+            sids = [s for s in sale_ids if s in text]
+            others = [i for i in items_by_id if i in text and i != iid]
+            if len(sids) > 1 or others:
+                continue    # сняли сразу несколько лотов — не годится как образец
+            sid = sids[0] if sids else None
+            if sid or iid in text:
+                mapping = {"sale_id": sid, "item_id": demo["item_id"], "product_id": demo["product_id"],
+                           "account_id": find_field(demo["raw"], "account_id"), "user_id": uid}
+                tpl = _make_template(cap, mapping)
+                if _has(tpl, "sale_id") or _has(tpl, "item_id"):
+                    ops["cancel"] = tpl
+                    break
+
+    # список лотов товара: GET с id товара в адресе, в ответе — лоты с ценами
+    for cap in reversed(caps):
+        if cap["method"] != "GET" or cap["status"] != 200 or (uid and uid in cap["url"]):
+            continue
+        pid = next((p for p in product_ids if p in cap["url"]), None)
+        if pid and _sales_in(_json_or_none(cap["body"])):
+            ops["best"] = {"method": "GET", "url": cap["url"].replace(pid, "{{product_id}}"),
+                           "body": None, "kind": None}
+            break
+    return ops
+
+
+def _origin(url: str) -> str:
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}"
+
+
+def relative_to_market(ops: dict, cfg: dict) -> dict:
+    """Адрес сервера нового маркета в выученных запросах -> {{market_origin}}:
+    выученное не зависит от того, на каком домене сейчас новый маркет."""
+    origin = _origin(cfg["inventory_api"])
+    for tpl in ops.values():
+        if tpl["url"].startswith(origin + "/"):
+            tpl["url"] = "{{market_origin}}" + tpl["url"][len(origin):]
+    return ops
+
+
+def load_learned(path: str) -> dict | None:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        ops = data.get("ops") or {}
+        return ops if all(k in ops for k in ("best", "create", "cancel")) else None
+    except Exception:
+        return None
+
+
+def save_learned(path: str, ops: dict):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "saved": time.strftime("%Y-%m-%d %H:%M:%S"), "ops": ops},
+                      f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"Не смог сохранить {path}: {e}")
+
+
+def forget_learned(path: str):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def enter_pressed() -> bool:
+    """Нажат ли Enter в окне программы (не блокирует)."""
+    try:
+        import msvcrt
+        hit = False
+        while msvcrt.kbhit():
+            if msvcrt.getwch() in ("\r", "\n"):
+                hit = True
+        return hit
+    except ImportError:
+        pass
+    try:
+        import select
+        if sys.stdin and sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
+            sys.stdin.readline()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+_TEACH_STEPS = (("best", "вижу лоты товара"), ("create", "вижу выставление"), ("cancel", "вижу снятие"))
+
+
+def teach_new_market(api: Api, browser: Browser, cfg: dict, new_items: list[dict]) -> dict | None:
+    """Ждёт, пока вы один раз выставите и снимете предмет на новом маркете, и запоминает как."""
+    items_by_id = {str(it["item_id"]): it for it in new_items}
+
+    def product_ids() -> set:
+        ids = {str(it["product_id"]) for it in new_items}
+        for cap in list(browser.captured):
+            for lst in dict_lists(_json_or_none(cap["body"]) if cap["method"] == "GET" else None):
+                ids.update(str(first(d, "product_id", "productId")) for d in lst
+                           if first(d, "product_id", "productId") is not None)
+        return ids
+
+    def learn() -> dict:
+        return learn_market_ops(list(browser.captured), items_by_id, product_ids(), api.user_id)
+
+    ops = learn()
+    if all(k in ops for k, _ in _TEACH_STEPS):
+        print("Новый маркет: увидел, как сайт выставляет и снимает лоты. Запомнил, как выставлять на новом маркете.")
+        return ops
+    api.known_paths()   # адреса API из кода сайта — в лог, на случай если что-то пойдёт не так
+    minutes = max(1, int(cfg["teach_timeout_s"]) // 60)
+    print("\nНовый маркет: я ещё не знаю, как сайт выставляет и снимает лоты. Покажите один раз:\n"
+          "  1) в окне браузера откройте страницу любого товара на маркете (где видно лоты продавцов);\n"
+          "  2) выставьте на продажу ОДИН любой свой предмет (одну штуку), по любой цене;\n"
+          "  3) сразу снимите этот лот с продажи.\n"
+          "Я запомню, как это делает сайт, и дальше буду делать сам.\n"
+          f"Жду до {minutes} мин. Чтобы пропустить новый маркет — нажмите Enter.")
+    shown = set()
+    deadline = time.time() + float(cfg["teach_timeout_s"])
+    while time.time() < deadline:
+        if enter_pressed():
+            break
+        time.sleep(1)
+        browser.refresh()
+        ops = learn()
+        for key, label in _TEACH_STEPS:
+            if key in ops and key not in shown:
+                shown.add(key)
+                print(f"  ✓ {label}")
+        if len(shown) == len(_TEACH_STEPS):
+            break
+    browser.wait_quiet(min_s=1, quiet_s=1.5, max_s=8)
+    ops = learn()
+    missing = [label for key, label in _TEACH_STEPS if key not in ops]
+    if missing:
+        print(f"Не увидел: {', '.join(missing)}. Новый маркет в этот раз пропускаю.")
+        log(f"Обучение не завершено, выучено: {json.dumps(ops, ensure_ascii=False)}")
+        return None
+    print("Запомнил, как выставлять на новом маркете.")
+    return ops
+
+
+class OldMarket:
+    """Старый маркет (mm2.dreampets.gg) — адреса известны."""
+    tag = " (старый маркет)"
+
+    def __init__(self, api: Api):
+        self.api = api
+
+    def best(self, pid, count):
+        return self.api.get_best_sales(pid, count)
+
+    def cancel(self, listed):
+        self.api.cancel_sales([s["sale_id"] for _, s in listed])
+
+    def create(self, item, price):
+        _retry(lambda: self.api.create_sale(item, price))
+
+
+class NewMarket:
+    """Новый маркет — запросы повторяются по образцу, выученному у сайта."""
+    tag = ""
+
+    def __init__(self, api: Api, ops: dict, cfg: dict, learned_path: str):
+        self.api, self.ops, self.cfg, self.learned_path = api, ops, cfg, learned_path
+        self.sales_url = cfg["market_sales_user_api"].replace("{user_id}", api.user_id or "")
+        self._first = threading.Lock()
+        self.verified = False
+        self.stopped = None
+        self._worked = set()
+        self._missed = Counter()
+
+    def _values(self, item=None, sale=None, pid=None, price=None) -> dict:
+        v = {"user_id": self.api.user_id, "market_origin": _origin(self.cfg["inventory_api"])}
+        if item is not None:
+            v.update(item_id=item["item_id"], product_id=item["product_id"],
+                     account_id=find_field(item["raw"], "account_id"))
+        if sale is not None:
+            v["sale_id"] = sale["sale_id"]
+        if pid is not None:
+            v["product_id"] = pid
+        if price is not None:
+            tpl = self.ops["create"]
+            amount = price * tpl.get("price_scale", 1)
+            if tpl.get("price_scale", 1) != 1:
+                amount = int(round(amount))
+                v["price"] = str(amount) if tpl.get("price_type") == "str" else amount
+            else:
+                v["price"] = f"{amount:.2f}" if tpl.get("price_type") == "str" else round(amount, 2)
+        return {k: val for k, val in v.items() if val is not None}
+
+    def _call(self, name: str, values: dict, what: str):
+        tpl = self.ops[name]
+        text_values = {k: str(v) for k, v in values.items()}
+        url = _fill(tpl["url"], text_values)
+        body = raw = None
+        if tpl.get("body") is not None:
+            if tpl.get("kind") == "json":
+                body = _fill(tpl["body"], values)
+            else:
+                raw = _fill(tpl["body"], text_values)
+        try:
+            status, data = self.api._send(tpl["method"], url, body=body, raw=raw)
+        except Exception:
+            self._miss(name)
+            raise
+        if _ok(status):
+            self._worked.add(name)
+        elif status in (404, 405):
+            self._miss(name)
+        if not _ok(status):
+            raise Api._fail(what, status, data)
+        return data
+
+    def _miss(self, name: str):
+        # запрос ни разу не сработал и трижды «не найден»/недоступен — сайт поменял API;
+        # при следующем запуске выучим заново
+        if name in self._worked:
+            return
+        self._missed[name] += 1
+        if self._missed[name] >= 3 and not self.stopped:
+            forget_learned(self.learned_path)
+            self.stopped = ("сайт изменил API нового маркета — при следующем запуске "
+                            "покажите выставление ещё раз")
+
+    def best(self, pid, count):
+        if self.stopped:
+            raise ApiError(self.stopped)
+        data = self._call("best", self._values(pid=pid), "лоты товара")
+        return sorted(_sales_in(data), key=lambda s: s["price"])
+
+    def cancel(self, listed):
+        for item, sale in listed:
+            self._call("cancel", self._values(item=item, sale=sale), "снятие лота")
+
+    def create(self, item, price):
+        if self.stopped:
+            raise ApiError(self.stopped)
+        with self._first:
+            if self.stopped:
+                raise ApiError(self.stopped)
+            if not self.verified:
+                # первый лот — проверяем на сайте, что цена встала именно та
+                _retry(lambda: self._call("create", self._values(item=item, price=price), "выставление"))
+                problem = self._verify(item, price)
+                if problem:
+                    self.stopped = problem
+                    raise ApiError(problem)
+                self.verified = True
+                return
+        _retry(lambda: self._call("create", self._values(item=item, price=price), "выставление"))
+
+    def _verify(self, item, price) -> str | None:
+        for _ in range(3):
+            time.sleep(1)
+            status, data = self.api._send("GET", self.sales_url)
+            if not _ok(status):
+                continue
+            sale = next((s for s in _sales_in(data) if str(s["item_id"]) == str(item["item_id"])), None)
+            if sale is None:
+                continue
+            if abs(sale["price"] - price) < 0.005:
+                log(f"Проверка первого лота: {item['name']} выставлен по {sale['price']:.2f} — верно")
+                return None
+            forget_learned(self.learned_path)
+            return (f"проверка не прошла: просил {price:.2f}, на сайте {sale['price']:.2f} — "
+                    f"новый маркет остановлен")
+        return "проверка не прошла: выставленный лот не нашёлся среди ваших — новый маркет остановлен"
+
+
+def _retry(fn):
+    """Повторяет при сбое сети и ошибках сервера 5xx/429; отказ 4xx не повторяем."""
+    for attempt in range(3):
+        try:
+            return fn()
+        except ApiError as e:
+            if attempt == 2 or (e.status is not None and e.status < 500 and e.status != 429):
+                raise
+        except Exception:
+            if attempt == 2:
+                raise
+        time.sleep(1)
+
+
+# ---------- инвентарь ----------
+
+def _user_url(api: Api, cfg: dict, key: str) -> str | None:
+    return cfg[key].replace("{user_id}", api.user_id) if api.user_id else None
+
+
+def _safe_get(api: Api, url: str):
+    try:
+        return api._send("GET", url)
+    except Exception as e:
+        log(f"GET {url}: {e}")
+        return None, None
+
+
+def _captured_list(browser: Browser, path_re: str, field: str) -> list | None:
+    """Последний список, который сам сайт получил с подходящего адреса."""
+    for cap in reversed(list(browser.captured)):
+        if cap["method"] == "GET" and cap["status"] == 200 and re.search(path_re, urlparse(cap["url"]).path):
+            lst = extract_list(_json_or_none(cap["body"]), field)
+            if lst is not None:
+                return lst
+    return None
+
+
+def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool = True):
+    """Весь инвентарь и все ваши активные лоты на обоих маркетах.
+    Возвращает (предметы, лоты, замороженные аккаунты)."""
+    print("Сканирую инвентарь..." if open_sell_page else "Перечитываю инвентарь и лоты...")
+    api.reset_discovery()   # страница уже загрузилась — прежние неудачные поиски не в счёт
+
+    # старый маркет
+    old_error = None
+    try:
+        old_raw = expand_items(api.get_list("items_api", "items", "items"))
+    except Exception as e:
+        old_error, old_raw = e, []
+        log(f"Старый маркет: список предметов не получен: {e}")
+
+    if cfg["learn_from_site"] and open_sell_page:
         if browser.open_sell_page():
             print("Открыл страницу «Продажа» — сверяю инвентарь с тем, что показывает сайт...")
             browser.wait_quiet(min_s=3, quiet_s=2.5, max_s=20)
@@ -1451,36 +1950,89 @@ def load_inventory(api: Api, browser: Browser, cfg: dict):
             browser.wait_quiet(min_s=1, quiet_s=2, max_s=10)
         else:
             log("Ссылку «Продажа» на странице не нашёл")
-        ids = {str(it["item_id"]) for it in map(norm_item, raw_items) if it}
+
+    # новый маркет: инвентарь по известному адресу, иначе — то, что сайт показал сам
+    new_raw = []
+    if cfg["new_market"] and api.user_id:
+        url = _user_url(api, cfg, "inventory_api")
+        status, body = _safe_get(api, url)
+        if status == 200 and extract_list(body, "items") is not None:
+            new_raw = expand_items(api.collect_pages(url, "items", body))
+        else:
+            log(f"Новый маркет: инвентарь по {url} не получен ({status})")
+    if cfg["learn_from_site"]:
+        known = {str(it["item_id"]) for it in map(norm_item, old_raw + new_raw) if it}
         for url, lst in items_seen_by_site(list(browser.captured)):
-            new = [x for x in lst if str(norm_item(x)["item_id"]) not in ids]
-            if new:
-                ids.update(str(norm_item(x)["item_id"]) for x in new)
-                raw_items.extend(new)
-                print(f"  + {len(new)} шт. со страницы сайта ({urlparse(url).path})")
-                log(f"Предметы со страницы сайта: {url} (+{len(new)})")
+            extra = [x for x in lst if str(norm_item(x)["item_id"]) not in known]
+            if extra:
+                known.update(str(norm_item(x)["item_id"]) for x in extra)
+                # служба inventory — это новый маркет; остальное — старый
+                (new_raw if "/inventory/" in urlparse(url).path else old_raw).extend(extra)
+                log(f"Предметы со страницы сайта: {url} (+{len(extra)})")
+    if old_error is not None and not new_raw:
+        raise old_error
 
-    if items_error is not None and not raw_items:
-        raise items_error
     items, seen = [], set()
-    for x in raw_items:
-        it = norm_item(x)
-        if it and str(it["item_id"]) not in seen:
-            seen.add(str(it["item_id"]))
-            items.append(it)
-    if raw_items and not items:
+    for market, raw_list in (("old", old_raw), ("new", new_raw)):
+        for x in raw_list:
+            it = norm_item(x)
+            if it and str(it["item_id"]) not in seen:
+                seen.add(str(it["item_id"]))
+                it["market"] = market
+                items.append(it)
+    if (old_raw or new_raw) and not items:
         print("Сайт вернул предметы в незнакомом формате — подробности в логе.")
-        log(f"Пример ответа: {json.dumps(raw_items[0], ensure_ascii=False)[:1500]}")
+        log(f"Пример ответа: {json.dumps((old_raw or new_raw)[0], ensure_ascii=False)[:1500]}")
 
-    sales = [s for s in map(norm_sale, api.get_list("sales_user_api", "sales", "sales/user")) if s]
-    return items, [s for s in sales if sale_active(s)]
+    # ваши лоты
+    sales = []
+    if old_raw or old_error is None:
+        for s in map(norm_sale, api.get_list("sales_user_api", "sales", "sales/user")):
+            if s:
+                s["market"] = "old"
+                sales.append(s)
+    frozen = {}
+    if any(it["market"] == "new" for it in items):
+        url = _user_url(api, cfg, "market_sales_user_api")
+        lst = None
+        if url:
+            status, body = _safe_get(api, url)
+            if status == 200 and extract_list(body, "sales") is not None:
+                lst = api.collect_pages(url, "sales", body)
+        if lst is None:
+            lst = _captured_list(browser, r"/market/.*/users/[^/]+/sales$", "sales")
+        if lst is None:
+            raise RuntimeError("не удалось получить ваши лоты на новом маркете")
+        for s in map(norm_sale, lst):
+            if s:
+                s["market"] = "new"
+                sales.append(s)
+        # аккаунты Roblox, с которых сейчас нельзя торговать (заморожены)
+        url = _user_url(api, cfg, "inventory_gates_api")
+        gates = None
+        if url:
+            status, body = _safe_get(api, url)
+            gates = extract_list(body, "gates") if status == 200 else None
+        if gates is None:
+            gates = _captured_list(browser, r"/inventory/.*/account-inventory-gates$", "gates") or []
+        for g in gates:
+            if isinstance(g, dict) and g.get("tradable") is False and g.get("account_id"):
+                acc = g.get("account") if isinstance(g.get("account"), dict) else {}
+                frozen[str(g["account_id"])] = str(first(acc, "roblox_display_name", "roblox_name")
+                                                   or g["account_id"])
+    return items, [s for s in sales if sale_active(s)], frozen
 
 
-def plan_products(items: list[dict], my_sales: list[dict], cfg: dict):
-    """product_id -> {name, items}: что (пере)выставляем; плюс что пропущено и почему."""
+def plan_products(items: list[dict], my_sales: list[dict], cfg: dict, frozen: dict | None = None):
+    """(маркет, product_id) -> {name, items}: что (пере)выставляем; плюс что пропущено и почему."""
+    frozen = frozen or {}
     listed = {str(s["item_id"]) for s in my_sales if s["item_id"] is not None}
     products, skipped = {}, Counter()
     for it in items:
+        account = find_field(it["raw"], "account_id")
+        if account is not None and str(account) in frozen:
+            skipped[f"аккаунт {frozen[str(account)]} заморожен"] += 1
+            continue
         if str(it["item_id"]) not in listed:
             if it["blocked"] or status_blocked(it["status"], cfg):
                 skipped[it["status"] or "заблокирован"] += 1
@@ -1489,23 +2041,9 @@ def plan_products(items: list[dict], my_sales: list[dict], cfg: dict):
                 # числится на продаже, но лота среди ваших нет — снять его нечем
                 skipped[f"{it['status']} без лота"] += 1
                 continue
-        products.setdefault(it["product_id"], {"name": it["name"], "items": []})["items"].append(it)
+        key = (it.get("market", "old"), it["product_id"])
+        products.setdefault(key, {"name": it["name"], "items": []})["items"].append(it)
     return products, skipped
-
-
-def _create_retry(api: Api, item: dict, price: float):
-    for attempt in range(3):
-        try:
-            api.create_sale(item, price)
-            return
-        except ApiError as e:
-            # 4xx — сайт отказал осознанно, повтор не поможет
-            if attempt == 2 or (e.status is not None and e.status < 500 and e.status != 429):
-                raise
-        except Exception:
-            if attempt == 2:
-                raise
-        time.sleep(1)
 
 
 def target_price(peak: float, cfg: dict) -> float:
@@ -1516,29 +2054,29 @@ def target_price(peak: float, cfg: dict) -> float:
     return max(peak_cents - step, min_cents) / 100.0
 
 
-def reprice_one(api: Api, cfg: dict, pid, name: str, prod_items: list[dict],
-                sales_by_item: dict, my_item_ids: set, my_sale_ids: set):
+def reprice_one(market, cfg: dict, pid, name: str, prod_items: list[dict],
+                sales_by_item: dict, my_item_ids: set, my_sale_ids: set, my_uid: str | None = None):
     """Один товар: прочитать рынок -> снять свои лоты -> выставить все штуки
     по цене 5-го лота в топе (самого дорогого из топ-5) − 0.01. Возвращает (отчёт, изменено)."""
     top_n = int(cfg["top_n"])
     listed = [(it, sales_by_item[str(it["item_id"])]) for it in prod_items
               if str(it["item_id"]) in sales_by_item]
-    sale_ids = [s["sale_id"] for _, s in listed]
     prev_prices = {str(it["item_id"]): s["price"] for it, s in listed}
-    removed = len(sale_ids)
+    removed = len(listed)
     count = len(prod_items)
 
     # а) рынок без своих лотов: берём с запасом на свои и выкидываем их.
     # Читаем ДО снятия, чтобы при ошибке чтения лоты не остались снятыми.
-    best = api.get_best_sales(pid, count=top_n + removed)
-    market = sorted(s["price"] for s in best
-                    if str(s["sale_id"]) not in my_sale_ids and str(s["item_id"]) not in my_item_ids)[:top_n]
-    if not market:
+    best = market.best(pid, count=top_n + removed)
+    prices = sorted(s["price"] for s in best
+                    if str(s["sale_id"]) not in my_sale_ids and str(s["item_id"]) not in my_item_ids
+                    and not (my_uid and str(s.get("user_id")) == my_uid))[:top_n]
+    if not prices:
         return f"{name}: на рынке нет других продавцов -> оставил как было", False
 
-    peak = market[-1]
+    peak = prices[-1]
     target = target_price(peak, cfg)
-    top = f"{len(market)}-й в топе {peak:.2f}"
+    top = f"{len(prices)}-й в топе {peak:.2f}"
 
     if len(prev_prices) == count and all(
             p is not None and round(p * 100) == round(target * 100) for p in prev_prices.values()):
@@ -1548,39 +2086,69 @@ def reprice_one(api: Api, cfg: dict, pid, name: str, prod_items: list[dict],
         return f"{name}: [ТЕСТ] {top} -> снял бы {removed}, выставил бы {count} шт. по {target:.2f}", False
 
     # б) снимаем свои активные лоты этого товара
-    if sale_ids:
-        api.cancel_sales(sale_ids)
+    if listed:
+        market.cancel(listed)
         time.sleep(0.4)
 
     # в) выставляем все штуки; ошибка на одной не мешает остальным
     failed = []
     for it in prod_items:
         try:
-            _create_retry(api, it, target)
+            market.create(it, target)
         except Exception as e:
             failed.append(e)
     if failed:
-        raise RuntimeError(f"выставил {count - len(failed)} из {count} по {target:.2f}; {short(failed[0], 100)}")
+        raise RuntimeError(f"выставил {count - len(failed)} из {count} по {target:.2f}; {short(failed[0], 120)}")
     return f"{name}: {top} -> снял {removed}, выставил {count} шт. по {target:.2f}", True
 
 
-def run_pricing(api: Api, browser: Browser, cfg: dict):
-    t0 = time.time()
-    items, my_sales = load_inventory(api, browser, cfg)
-    statuses = Counter(it["status"] or "без статуса" for it in items)
-    print(f"Предметов: {len(items)} ({', '.join(f'{k}: {v}' for k, v in statuses.most_common())}), "
-          f"ваших лотов на продаже: {len(my_sales)}")
-    log("Предметы (id | товар | название | статус):\n  " + "\n  ".join(
-        f"{it['item_id']} | {it['product_id']} | {it['name']} | {it['status']}"
-        f"{' | заблокирован' if it['blocked'] else ''}" for it in items))
-    if items:
-        log(f"Пример предмета: {json.dumps(items[0]['raw'], ensure_ascii=False)[:1500]}")
-    if my_sales:
-        log(f"Лоты: {[(s['sale_id'], s['item_id'], s['price']) for s in my_sales]}")
+def _summary(items: list[dict], sales: list[dict], market: str) -> str:
+    its = [it for it in items if it.get("market") == market]
+    n_products = len({it["product_id"] for it in its})
+    n_sales = sum(1 for s in sales if s.get("market") == market)
+    return f"{len(its)} шт., товаров: {n_products}, ваших лотов: {n_sales}"
 
-    products, skipped = plan_products(items, my_sales, cfg)
+
+def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str):
+    t0 = time.time()
+    items, my_sales, frozen = load_inventory(api, browser, cfg)
+    new_items = [it for it in items if it["market"] == "new"]
+
+    # новый маркет: способ выставления — из файла, иначе учимся у вас
+    markets = {"old": OldMarket(api)}
+    if new_items:
+        ops = load_learned(learned_path)
+        if ops:
+            print("Новый маркет: выставляю так, как запомнил раньше (mm2pricer_learned.json).")
+        else:
+            ops = teach_new_market(api, browser, cfg, new_items)
+            if ops:
+                ops = relative_to_market(ops, cfg)
+                save_learned(learned_path, ops)
+                log(f"Выучено для нового маркета: {json.dumps(ops, ensure_ascii=False)}")
+                # пока вы показывали, состояние лотов могло поменяться — читаем заново
+                items, my_sales, frozen = load_inventory(api, browser, cfg, open_sell_page=False)
+        if ops:
+            markets["new"] = NewMarket(api, ops, cfg, learned_path)
+
+    print(f"Старый маркет: {_summary(items, my_sales, 'old')}")
+    if new_items:
+        print(f"Новый маркет: {_summary(items, my_sales, 'new')}")
+    log("Предметы (маркет | id | товар | название | статус):\n  " + "\n  ".join(
+        f"{it['market']} | {it['item_id']} | {it['product_id']} | {it['name']} | {it['status']}"
+        f"{' | заблокирован' if it['blocked'] else ''}" for it in items))
+    if my_sales:
+        log(f"Лоты: {[(s['market'], s['sale_id'], s['item_id'], s['price']) for s in my_sales]}")
+
+    products, skipped = plan_products(items, my_sales, cfg, frozen)
     if skipped:
-        print("Пропускаю (выставлять нельзя): " + ", ".join(f"{k}: {v}" for k, v in skipped.items()))
+        print("Пропускаю: " + ", ".join(f"{k}: {v} шт." for k, v in skipped.items()))
+    if "new" not in markets:
+        n = sum(len(p["items"]) for (mk, _), p in products.items() if mk == "new")
+        if n:
+            print(f"Новый маркет пропущен ({n} шт.): не знаю, как на нём выставлять.")
+        products = {k: p for k, p in products.items() if k[0] in markets}
+
     sales_by_item = {str(s["item_id"]): s for s in my_sales if s["item_id"] is not None}
     my_item_ids = {str(it["item_id"]) for it in items}
     my_sale_ids = {str(s["sale_id"]) for s in my_sales}
@@ -1588,27 +2156,35 @@ def run_pricing(api: Api, browser: Browser, cfg: dict):
     total = len(products)
     workers = max(1, int(cfg["workers"]))
     print(f"Товаров к выставлению: {total} ({sum(len(p['items']) for p in products.values())} шт.). "
-          f"Обрабатываю ({workers} параллельно): чтение цен -> снятие лотов -> выставление...\n")
+          f"Обрабатываю ({workers} параллельно): чтение цен -> снятие лотов -> выставление...\n"
+          f"Не трогайте окно браузера до конца работы.\n")
 
     changed = errors = done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(reprice_one, api, cfg, pid, p["name"], p["items"],
-                               sales_by_item, my_item_ids, my_sale_ids): p
-                   for pid, p in products.items()}
+        futures = {}
+        for (mk, pid), p in products.items():
+            market = markets[mk]
+            name = p["name"] + market.tag
+            fut = pool.submit(reprice_one, market, cfg, pid, name, p["items"],
+                              sales_by_item, my_item_ids, my_sale_ids, api.user_id)
+            futures[fut] = name
         for fut in as_completed(futures):
-            p = futures[fut]
+            name = futures[fut]
             done += 1
             try:
                 report, did_change = fut.result()
             except Exception as e:
                 errors += 1
-                log(f"{p['name']}: {traceback.format_exc()}")
-                print(f"  [{done}/{total}] {p['name']}: ошибка ({short(e)})")
+                log(f"{name}: {traceback.format_exc()}")
+                print(f"  [{done}/{total}] {name}: ошибка ({short(e)})")
                 continue
             if did_change:
                 changed += 1
             print(f"  [{done}/{total}] {report}")
 
+    stopped = getattr(markets.get("new"), "stopped", None)
+    if stopped:
+        print(f"\nНовый маркет: {stopped}.")
     print(f"\nГотово за {time.time() - t0:.1f} с. Переоценено товаров: {changed}. Ошибок: {errors}.")
 
 
@@ -1634,6 +2210,8 @@ def main(argv=None):
     parser.add_argument("--dry-run", action="store_true", help="только показать, ничего не менять")
     parser.add_argument("--config", default=CONFIG_PATH, help="путь к mm2pricer_config.json")
     parser.add_argument("--log", default=LOG_PATH, help="куда писать лог")
+    parser.add_argument("--learned", default=LEARNED_PATH,
+                        help="где хранить, как выставлять на новом маркете")
     parser.add_argument("--no-pause", action="store_true", help="не ждать Enter в конце")
     args, _ = parser.parse_known_args(argv)
 
@@ -1663,8 +2241,8 @@ def main(argv=None):
             print("Не дождался входа в аккаунт. Завершаюсь.")
             return
 
-        print(f"Вход подтверждён ({user}). Не трогайте окно браузера до конца работы.\n")
-        run_pricing(api, browser, cfg)
+        print(f"Вход подтверждён ({user}).\n")
+        run_pricing(api, browser, cfg, args.learned)
     except KeyboardInterrupt:
         print("\nПрервано.")
     except Exception as e:

@@ -40,7 +40,8 @@ def test_extract_and_normalize():
             {"item_id": "i1", "product_id": "P1", "name": "Knife", "status": "on_sale", "blocked": False}]
     assert m.norm_item({"id": 1, "product_id": 2, "tradable": False})["blocked"] is True
     sale = m.norm_sale({"id": "s1", "item": {"id": "i1"}, "price": {"amount": "12,50"}, "status": "Active"})
-    assert sale == {"sale_id": "s1", "item_id": "i1", "product_id": None, "price": 12.5, "status": "active"}
+    assert sale == {"sale_id": "s1", "item_id": "i1", "product_id": None, "price": 12.5,
+                    "status": "active", "user_id": None}
     assert m.sale_active(sale)
     assert not m.sale_active(dict(sale, status="sold"))
     assert m.extract_list({"error": "x"}, "items") is None
@@ -107,10 +108,73 @@ def test_missing_fields_and_find_field():
     assert m.find_field(raw, "nothing") is None
 
 
+def _cap(seq, method, url, status=200, body=None, post=None):
+    return {"seq": seq, "method": method, "url": url, "status": status,
+            "body": json.dumps(body) if body is not None else "", "post": post}
+
+
+def test_learn_market_ops():
+    # формат — как в настоящем логе нового маркета
+    uid = "95071cd0-u"
+    item = m.norm_item({"id": "it-1", "user_id": uid, "account_id": "acc-1", "product_id": "pr-1",
+                        "product": {"id": "pr-1", "name": "Bauble"}})
+    base = "https://mm2-test.dreampets.gg/api/market/v1"
+    caps = [
+        _cap(1, "GET", f"{base}/market/products?currency=rub", body={"products": [{"product_id": "pr-9", "name": "X"}]}),
+        _cap(2, "GET", f"{base}/market/products/pr-9/sales?currency=rub&sort=price_asc",
+             body={"sales": [{"id": "s-a", "user_id": "other", "item_id": "x1", "price": "10.50"}]}),
+        _cap(3, "POST", f"{base}/sales", status=201,
+             body={"id": "sale-new", "item_id": "it-1", "price": "99.99"},
+             post=json.dumps({"account_id": "acc-1", "item_id": "it-1", "price": "99.99", "currency": "rub"})),
+        _cap(4, "GET", f"{base}/users/{uid}/sales",
+             body={"sales": [{"id": "sale-new", "user_id": uid, "item_id": "it-1", "price": "99.99"}]}),
+        _cap(5, "DELETE", f"{base}/sales/sale-new", status=204),
+    ]
+    ops = m.learn_market_ops(caps, {"it-1": item}, {"pr-1", "pr-9"}, uid)
+    assert ops["best"]["url"] == f"{base}/market/products/{{{{product_id}}}}/sales?currency=rub&sort=price_asc"
+    assert ops["create"]["url"] == f"{base}/sales"
+    assert ops["create"]["body"] == {"account_id": "{{account_id}}", "item_id": "{{item_id}}",
+                                     "price": "{{price}}", "currency": "rub"}
+    assert ops["create"]["price_type"] == "str" and ops["create"]["price_scale"] == 1
+    assert ops["cancel"]["url"] == f"{base}/sales/{{{{sale_id}}}}" and ops["cancel"]["method"] == "DELETE"
+    # повтор по образцу для другого предмета и цены
+    other = m.norm_item({"id": "it-2", "account_id": "acc-2", "product_id": "pr-2", "product": {"id": "pr-2"}})
+    nm = m.NewMarket.__new__(m.NewMarket)
+    nm.api = type("A", (), {"user_id": uid})()
+    nm.ops, nm.cfg = ops, m.DEFAULT_CONFIG
+    vals = nm._values(item=other, price=13.99)
+    assert m._fill(ops["create"]["body"], vals) == {"account_id": "acc-2", "item_id": "it-2",
+                                                     "price": "13.99", "currency": "rub"}
+    assert m._fill(ops["cancel"]["url"], {"sale_id": "zz"}) == f"{base}/sales/zz"
+
+
+def test_learn_rejects_bulk_listing():
+    a = m.norm_item({"id": "it-1", "product_id": "pr-1", "product": {"id": "pr-1"}})
+    b = m.norm_item({"id": "it-2", "product_id": "pr-1", "product": {"id": "pr-1"}})
+    caps = [_cap(1, "POST", "https://x.dreampets.gg/api/market/v1/sales", 201, body={"ok": True},
+                 post=json.dumps({"items": [{"item_id": "it-1", "price": "5"}, {"item_id": "it-2", "price": "5"}]}))]
+    assert "create" not in m.learn_market_ops(caps, {"it-1": a, "it-2": b}, set(), "u")
+
+
+def test_learn_price_in_kopecks():
+    item = m.norm_item({"id": "it-1", "product_id": "pr-1", "product": {"id": "pr-1"}})
+    caps = [_cap(1, "POST", "https://x.dreampets.gg/api/market/v1/sales", 201,
+                 body={"ok": True}, post=json.dumps({"item_id": "it-1", "price": 9999})),
+            _cap(2, "GET", "https://x.dreampets.gg/api/market/v1/users/u/sales",
+                 body={"sales": [{"id": "s1", "item_id": "it-1", "price": "99.99"}]})]
+    ops = m.learn_market_ops(caps, {"it-1": item}, set(), "u")
+    assert ops["create"]["price_scale"] == 100 and ops["create"]["price_type"] == "num"
+    nm = m.NewMarket.__new__(m.NewMarket)
+    nm.api = type("A", (), {"user_id": "u"})()
+    nm.ops, nm.cfg = ops, m.DEFAULT_CONFIG
+    assert nm._values(price=13.99)["price"] == 1399
+
+
 def test_redact():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
-    text = m.redact(f'Bearer abc {jwt} {{"refresh_token": "opaque", "name": "x"}}')
+    text = m.redact(f'Bearer abc {jwt} {{"refresh_token": "opaque", "name": "x", "email": "a.b@mail.ru"}}')
     assert "abc" not in text and jwt not in text and "opaque" not in text and '"name": "x"' in text
+    assert "a.b@mail.ru" not in text
 
 
 if __name__ == "__main__":
