@@ -5,13 +5,25 @@ MM2 Pricer v2 — разовый репрайсер для dreampets.gg (вер�
   1) Поднимает Chrome (или Edge) на ВРЕМЕННОМ, одноразовом профиле (ваши
      куки/сессии не используются и не сохраняются).
   2) Открывает окно — вы входите в свой аккаунт вручную.
-  3) Делает ОДИН проход по вашим товарам. Для каждого товара по порядку:
+  3) Сканирует ВЕСЬ инвентарь (все страницы списка, плюс то, что показывает
+     сайт на странице «Продажа») и делает ОДИН проход по товарам:
        а) считывает цены на рынке (топ-5 самых дешёвых, без ваших лотов);
        б) снимает все ваши активные лоты этого товара;
-       в) выставляет все ваши штуки по цене (самая высокая из топ-5) − 1 копейка.
+       в) выставляет все ваши штуки по цене 5-го лота топа (самого дорогого
+          из топ-5) − 1 копейка.
   4) Разлогинивается (полностью удаляет временный профиль) и закрывается.
 
 Никакого цикла: один запуск = одна смена цен.
+
+Что нового в v2.1:
+  * Предмет выставляется, если его статус не означает «продан / выведен /
+    заблокирован» — переименование статусов на сайте больше не мешает.
+  * Списки предметов и лотов читаются целиком, даже если сайт отдаёт их
+    постранично.
+  * Программа открывает страницу «Продажа» и подсматривает, откуда сайт сам
+    берёт ваш инвентарь — так находятся предметы, которых нет в старом API.
+  * Если сайт при выставлении требует новое поле, программа берёт его из
+    данных предмета и повторяет запрос.
 
 Что нового в v2 (чтобы обновления сайта не ломали программу):
   * Токен ищется не только в localStorage['auth']: программа подсматривает,
@@ -33,6 +45,7 @@ import re
 import sys
 import json
 import time
+import base64
 import shutil
 import socket
 import argparse
@@ -40,8 +53,9 @@ import tempfile
 import threading
 import traceback
 import subprocess
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from urllib.parse import urlparse, urlencode, unquote
+from urllib.parse import urlparse, urlencode, unquote, urljoin, parse_qsl, urlunparse
 
 import requests
 import websocket
@@ -54,7 +68,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.0"
+VERSION = "2.1"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -75,9 +89,15 @@ DEFAULT_CONFIG = {
     "top_n": 5,
     "workers": 10,
 
-    # статусы предметов: какие считаются «моими» и какие — «выставлен на продажу»
+    # статусы, при которых предмет точно можно выставить (или он уже выставлен)
     "inventory_statuses": ["in_inventory", "on_sale"],
-    "on_sale_statuses": ["on_sale"],
+    # слова в статусе, при которых предмет выставлять нельзя
+    # (sold, withdrawn, trade_lock, pending, reserved ...)
+    "skip_status_words": ["sold", "withdraw", "lock", "hold", "pend", "trade", "reserv",
+                          "delet", "cancel", "block", "ban", "freez", "transfer", "deliver",
+                          "process", "wait", "refund", "expire", "remov", "escrow"],
+    # открыть страницу «Продажа» и взять инвентарь так, как его видит сайт
+    "learn_from_site": True,
 
     "dry_run": False,
     # auto — через вкладку браузера, при неудаче напрямую; browser; requests
@@ -211,6 +231,13 @@ def to_price(v) -> float | None:
         return None
 
 
+# флаги в предмете, означающие «выставлять нельзя»
+_BLOCK_IF_TRUE = ("locked", "is_locked", "trade_locked", "is_trade_locked", "on_hold", "is_on_hold",
+                  "withdrawn", "is_withdrawn", "sold", "is_sold")
+_BLOCK_IF_FALSE = ("tradable", "is_tradable", "tradeable", "can_sell", "sellable", "is_sellable",
+                   "can_be_sold", "available", "is_available")
+
+
 def norm_item(raw) -> dict | None:
     if not isinstance(raw, dict):
         return None
@@ -220,11 +247,15 @@ def norm_item(raw) -> dict | None:
     if item_id is None or pid is None:
         return None
     name = first(product, "name", "title", "display_name") or first(raw, "name", "title") or pid
+    blocked = (any(raw.get(k) is True for k in _BLOCK_IF_TRUE)
+               or any(raw.get(k) is False for k in _BLOCK_IF_FALSE))
     return {
         "item_id": item_id,
         "product_id": pid,
         "name": str(name),
-        "status": str(raw.get("status") or "").strip().lower(),
+        "status": str(raw.get("status") or raw.get("state") or "").strip().lower(),
+        "blocked": blocked,
+        "raw": raw,
     }
 
 
@@ -232,14 +263,187 @@ def norm_sale(raw) -> dict | None:
     if not isinstance(raw, dict):
         return None
     item = raw.get("item") if isinstance(raw.get("item"), dict) else {}
+    product = raw.get("product") if isinstance(raw.get("product"), dict) else {}
     sale_id = first(raw, "sale_id", "saleId", "id", "_id")
     if sale_id is None:
         return None
     return {
         "sale_id": sale_id,
         "item_id": first(raw, "item_id", "itemId") or first(item, "item_id", "itemId", "id", "_id"),
+        "product_id": first(raw, "product_id", "productId") or first(product, "product_id", "productId", "id"),
         "price": to_price(first(raw, "price", "amount", "cost")),
+        "status": str(raw.get("status") or raw.get("state") or "").strip().lower(),
     }
+
+
+_WORD_SPLIT_RE = re.compile(r"[^0-9a-zа-яё]+")
+
+
+def _status_words(status: str) -> list[str]:
+    return [w for w in _WORD_SPLIT_RE.split(status.lower()) if w]
+
+
+def status_blocked(status: str, cfg: dict) -> bool:
+    """Статус означает «выставлять нельзя» (продан, выведен, заблокирован...)."""
+    if not status or status in {s.lower() for s in cfg["inventory_statuses"]}:
+        return False
+    stop = [w.lower() for w in cfg["skip_status_words"]]
+    return any(word.startswith(s) for word in _status_words(status) for s in stop)
+
+
+def looks_listed(status: str) -> bool:
+    return any(w in ("sale", "listed", "selling", "onsale") for w in _status_words(status))
+
+
+_SALE_DONE_WORDS = ("sold", "cancel", "complet", "finish", "expire", "close", "delet",
+                    "withdraw", "inactive", "archiv")
+
+
+def sale_active(sale: dict) -> bool:
+    return not any(w.startswith(s) for w in _status_words(sale["status"]) for s in _SALE_DONE_WORDS)
+
+
+_NESTED_ITEM_KEYS = ("items", "item_list", "itemList", "units", "children")
+_ID_LIST_KEYS = ("item_ids", "itemIds", "ids")
+
+
+def expand_items(lst: list) -> list[dict]:
+    """Разворачивает сгруппированные записи («Candy ×6» -> 6 предметов):
+    {"product": {...}, "items": [{...}, ...]} или {"product": {...}, "item_ids": [...]}."""
+    out = []
+    for x in lst:
+        if not isinstance(x, dict):
+            continue
+        product = x.get("product") if isinstance(x.get("product"), dict) else None
+        if product is not None:
+            nested = next((x[k] for k in _NESTED_ITEM_KEYS if isinstance(x.get(k), list) and x[k]
+                           and all(isinstance(y, dict) for y in x[k])), None)
+            if nested is not None:
+                for y in nested:
+                    y = dict(y)
+                    if not isinstance(y.get("product"), dict) and not first(y, "product_id", "productId"):
+                        y["product"] = product
+                    if "status" in x and "status" not in y:
+                        y["status"] = x["status"]
+                    out.append(y)
+                continue
+            ids = next((x[k] for k in _ID_LIST_KEYS if isinstance(x.get(k), list) and x[k]
+                        and all(isinstance(i, (str, int)) for i in x[k])), None)
+            if ids is not None:
+                out.extend({"item_id": i, "product": product, "status": x.get("status")} for i in ids)
+                continue
+        out.append(x)
+    return out
+
+
+def ident(x) -> str:
+    """Ключ записи для отсева повторов при постраничной загрузке."""
+    if isinstance(x, dict):
+        v = first(x, "item_id", "sale_id", "itemId", "saleId", "id", "_id")
+        if v is not None:
+            return str(v)
+    return json.dumps(x, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def add_params(url: str, params: dict | None) -> str:
+    if not params:
+        return url
+    u = urlparse(url)
+    q = dict(parse_qsl(u.query, keep_blank_values=True))
+    q.update({k: str(v) for k, v in params.items()})
+    return urlunparse(u._replace(query=urlencode(q)))
+
+
+_TOTAL_KEYS = ("total", "total_count", "totalCount", "total_items", "totalItems", "count")
+_MORE_KEYS = ("has_more", "hasMore", "has_next", "hasNext", "hasNextPage", "has_next_page")
+_PAGES_KEYS = ("pages", "total_pages", "totalPages", "last_page", "lastPage", "page_count", "pageCount")
+_NEXT_KEYS = ("next", "next_page", "nextPage", "next_url", "nextUrl", "next_page_url")
+_CURSOR_KEYS = ("next_cursor", "nextCursor", "cursor", "after", "next_token", "nextToken")
+# размеры, на которых список часто обрезан страницей
+_ROUND_SIZES = {10, 12, 15, 16, 20, 24, 25, 30, 32, 36, 40, 48, 50, 60, 64, 72, 80, 96, 100,
+                120, 128, 150, 200, 250, 256, 300, 500, 1000}
+
+
+def page_hints(body, n: int) -> dict:
+    """Признаки того, что в ответе только часть списка."""
+    hints = {"more": None, "total": None, "next": None, "cursor": None}
+    if not isinstance(body, dict):
+        return hints
+    blocks = [body] + [body[k] for k in ("meta", "pagination", "paging", "page_info", "pageInfo", "data")
+                       if isinstance(body.get(k), dict)]
+    for b in blocks:
+        for k in _TOTAL_KEYS:
+            v = b.get(k)
+            if isinstance(v, int) and not isinstance(v, bool) and v > n:
+                hints["more"], hints["total"] = True, v
+        for k in _MORE_KEYS:
+            if isinstance(b.get(k), bool):
+                hints["more"] = b[k] or bool(hints["more"])
+        for k in _PAGES_KEYS:
+            v = b.get(k)
+            if isinstance(v, int) and not isinstance(v, bool) and v > 1:
+                hints["more"] = True
+        for k in _NEXT_KEYS:
+            v = b.get(k)
+            if isinstance(v, str) and v and (v.startswith("/") or "://" in v or "?" in v):
+                hints["more"], hints["next"] = True, v
+        for k in _CURSOR_KEYS:
+            v = b.get(k)
+            if isinstance(v, (str, int)) and not isinstance(v, bool) and v != "":
+                hints["more"], hints["cursor"] = True, (k, v)
+    return hints
+
+
+def missing_fields(data) -> list[str]:
+    """Какие поля сайт требует в запросе (по тексту ошибки 400/422)."""
+    names = []
+    if isinstance(data, dict):
+        detail = data.get("detail")
+        if isinstance(detail, list):
+            for d in detail:
+                if not isinstance(d, dict):
+                    continue
+                loc = d.get("loc") or []
+                kind = f"{d.get('type', '')} {d.get('msg', '')}".lower()
+                if loc and isinstance(loc[-1], str) and ("missing" in kind or "required" in kind):
+                    names.append(loc[-1])
+        errors = data.get("errors")
+        if isinstance(errors, dict):
+            names += [str(k).split(".")[-1] for k in errors]
+    text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
+    names += re.findall(r"['\"`]?([A-Za-z_][A-Za-z0-9_]*)['\"`]? (?:is|field is|field) required", text or "")
+    out = []
+    for n in names:
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+def _name_variants(name: str) -> set[str]:
+    snake = re.sub(r"(?<!^)(?=[A-Z])", "_", name).lower()
+    parts = snake.split("_")
+    camel = parts[0] + "".join(p.title() for p in parts[1:])
+    return {name, snake, camel}
+
+
+def find_field(raw: dict, name: str):
+    """Значение поля name где-нибудь в данных предмета (account_id, roblox_account_id ...)."""
+    variants = _name_variants(name)
+    queue = [raw]
+    while queue:
+        d = queue.pop(0)
+        for k, v in d.items():
+            if k in variants and v is not None and not isinstance(v, (dict, list)):
+                return v
+        queue.extend(v for v in d.values() if isinstance(v, dict))
+    # account_id -> {"account": {"id": ...}}
+    m = re.match(r"^(.+?)_?(?:id|Id|ID)$", name)
+    if m:
+        for base in _name_variants(m.group(1)):
+            sub = raw.get(base)
+            if isinstance(sub, dict) and first(sub, "id", "_id") is not None:
+                return first(sub, "id", "_id")
+    return None
 
 
 def profile_name(body) -> str | None:
@@ -347,6 +551,12 @@ class CDPError(Exception):
     pass
 
 
+class ApiError(RuntimeError):
+    def __init__(self, message: str, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 class CDPSession:
     """Постоянное соединение с вкладкой: команды + события (Network.*)."""
 
@@ -373,7 +583,7 @@ class CDPSession:
                         slot[0].set()
                 elif self.on_event:
                     try:
-                        self.on_event(msg.get("method"), msg.get("params") or {})
+                        self.on_event(self, msg.get("method"), msg.get("params") or {})
                     except Exception:
                         pass
         except Exception:
@@ -448,6 +658,20 @@ _INLINE_SCRIPTS_JS = """JSON.stringify([...document.scripts].filter(s => !s.src)
 
 _LOGOUT_JS = "try { localStorage.clear(); sessionStorage.clear(); } catch (e) {}"
 
+_SELL_LINK_JS = r"""(() => {
+  const want = /^(продажа|продать|мои продажи|sell|selling)$/i;
+  const els = [...document.querySelectorAll('a, button, [role="tab"], [role="link"], [role="button"]')];
+  const el = els.find(e => want.test((e.innerText || e.textContent || '').trim()));
+  if (!el) return '';
+  el.click();
+  return el.href || (el.innerText || '').trim();
+})()
+//# sourceURL=""" + _OUR_SOURCE
+
+_SCROLL_JS = """(() => { window.scrollTo(0, document.body.scrollHeight);
+  document.querySelectorAll('*').forEach(e => { if (e.scrollHeight > e.clientHeight + 50) e.scrollTop = e.scrollHeight; }); })()
+//# sourceURL=""" + _OUR_SOURCE
+
 # заголовки, которые не надо повторять за сайтом (их ставит сам браузер/requests)
 _SKIP_HEADERS = {
     "accept", "accept-encoding", "accept-language", "cache-control", "connection",
@@ -484,6 +708,9 @@ class Browser:
         self._req_meta = {}                  # requestId -> (method, url)
         self.sniffed = {}                    # host -> {заголовок: значение}
         self.observed = {}                   # (method, url без query) -> status
+        self.captured = []                   # ответы API, которые получил сам сайт
+        self._body_threads = []
+        self.last_api_event = time.time()
         self._cookie_cache = {}
         self._ua = None
 
@@ -613,7 +840,8 @@ class Browser:
             stack = stack.get("parent")
         return False
 
-    def _on_event(self, method: str, p: dict):
+    def _on_event(self, sess: CDPSession, method: str, p: dict):
+        rid = p.get("requestId")
         if method == "Network.requestWillBeSent":
             req = p.get("request") or {}
             url = req.get("url", "")
@@ -623,17 +851,70 @@ class Browser:
                 return
             if p.get("type") not in ("XHR", "Fetch") and "/api/" not in url:
                 return
-            self._req_meta[p.get("requestId")] = (req.get("method", "GET"), url)
+            self._req_meta[rid] = [req.get("method", "GET"), url, None, ""]
+            self.last_api_event = time.time()
             self._remember_headers(url, req.get("headers") or {})
         elif method == "Network.requestWillBeSentExtraInfo":
-            meta = self._req_meta.get(p.get("requestId"))
+            meta = self._req_meta.get(rid)
             if meta:
                 self._remember_headers(meta[1], p.get("headers") or {})
         elif method == "Network.responseReceived":
-            meta = self._req_meta.get(p.get("requestId"))
+            meta = self._req_meta.get(rid)
             if meta:
-                status = (p.get("response") or {}).get("status")
-                self.observed[(meta[0], meta[1].split("?")[0])] = status
+                resp = p.get("response") or {}
+                meta[2], meta[3] = resp.get("status"), resp.get("mimeType") or ""
+                self.observed[(meta[0], meta[1].split("?")[0])] = meta[2]
+        elif method == "Network.loadingFinished":
+            meta = self._req_meta.get(rid)
+            if meta:
+                self.last_api_event = time.time()
+                if "json" in meta[3] or not meta[3]:
+                    # тело ответа сайта — чтобы увидеть, откуда сайт берёт инвентарь.
+                    # Запрашиваем в отдельном потоке: этот поток читает ответы CDP.
+                    t = threading.Thread(target=self._grab_body, args=(sess, rid, list(meta)), daemon=True)
+                    self._body_threads.append(t)
+                    t.start()
+
+    def _grab_body(self, sess: CDPSession, rid: str, meta: list):
+        try:
+            res = sess.call("Network.getResponseBody", {"requestId": rid}, timeout=15)
+        except Exception:
+            return
+        body = res.get("body", "")
+        if res.get("base64Encoded"):
+            try:
+                body = base64.b64decode(body).decode("utf-8", "replace")
+            except Exception:
+                return
+        if len(body) <= 5_000_000:
+            self.captured.append({"method": meta[0], "url": meta[1], "status": meta[2], "body": body})
+
+    def wait_quiet(self, min_s: float, quiet_s: float, max_s: float):
+        """Ждёт, пока сайт перестанет делать запросы к API."""
+        start = time.time()
+        while True:
+            time.sleep(0.5)
+            now = time.time()
+            if now - start >= max_s:
+                break
+            if now - start >= min_s and now - self.last_api_event >= quiet_s:
+                break
+        for t in list(self._body_threads):
+            t.join(timeout=5)
+
+    def open_sell_page(self) -> str:
+        """Нажимает «Продажа» в меню сайта. Возвращает, куда перешли ('' — не нашёл)."""
+        try:
+            return self.evaluate(_SELL_LINK_JS, timeout=10, site_only=True) or ""
+        except Exception as e:
+            log(f"Не смог открыть «Продажа»: {e}")
+            return ""
+
+    def scroll_down(self):
+        try:
+            self.evaluate(_SCROLL_JS, timeout=10, site_only=True)
+        except Exception:
+            pass
 
     def _remember_headers(self, url: str, headers: dict):
         keep = {}
@@ -816,6 +1097,7 @@ class Api:
         self.http = requests.Session()
         self._discover_lock = threading.Lock()
         self._discover_at = {}
+        self.extra_fields = set()            # поля, которые сайт требует при выставлении
 
     # --- транспорт ---
 
@@ -863,7 +1145,7 @@ class Api:
         raise RuntimeError(f"нет связи с сайтом ({short(last)})")
 
     def _send(self, method, url, params=None, body=None, timeout=20):
-        full = url + ("?" + urlencode(params) if params else "")
+        full = add_params(url, params)
         headers = self.headers_for(url)
         data = None
         if body is not None:
@@ -875,7 +1157,7 @@ class Api:
             if not retry or attempt == 3:
                 break
             time.sleep(1.5 * 2 ** attempt)
-        log(f"{method} {full} {data or ''} -> {status} {text[:600]!r}")
+        log(f"{method} {full} {data or ''} -> {status} {text[:2000]!r}")
         try:
             return status, json.loads(text) if text else None
         except ValueError:
@@ -915,20 +1197,98 @@ class Api:
         return observed + sorted(found)
 
     @staticmethod
-    def _fail(what: str, status, data) -> RuntimeError:
+    def _fail(what: str, status, data) -> "ApiError":
         text = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False)
-        return RuntimeError(f"{what} вернул {status}: {short(text, 100)}")
+        return ApiError(f"{what} вернул {status}: {short(text, 100)}", status)
 
     # --- методы ---
 
     def get_list(self, key: str, field: str, what: str) -> list:
+        """Весь список (все страницы) с адреса key."""
         status, data = self.request("GET", key)
         if status != 200:
             raise self._fail(what, status, data)
-        lst = extract_list(data, field)
-        if lst is None:
+        if extract_list(data, field) is None:
             raise RuntimeError(f"{what}: не понял формат ответа ({short(json.dumps(data, ensure_ascii=False), 100)})")
-        return lst
+        return self.collect_pages(self.endpoints[key], field, data)
+
+    def collect_pages(self, url: str, field: str, body) -> list:
+        """Дочитывает остальные страницы списка, если сайт отдал не всё.
+        Пробует ссылку/курсор на следующую страницу, page, offset и большой limit —
+        засчитывается только то, что приносит новые записи."""
+        out, seen = [], set()
+
+        def add(lst) -> int:
+            new = 0
+            for x in lst or []:
+                k = ident(x)
+                if k not in seen:
+                    seen.add(k)
+                    out.append(x)
+                    new += 1
+            return new
+
+        first_page = extract_list(body, field) or []
+        add(first_page)
+        hints = page_hints(body, len(first_page))
+        if hints["more"] is False or (hints["more"] is None and len(first_page) not in _ROUND_SIZES):
+            return out
+        budget = [60]
+
+        def done() -> bool:
+            return budget[0] <= 0 or (hints["total"] is not None and len(out) >= hints["total"])
+
+        def get(u, params=None):
+            budget[0] -= 1
+            st, b = self._send("GET", u, params)
+            return (extract_list(b, field) if st == 200 else None), b
+
+        # 1) готовая ссылка на следующую страницу или курсор
+        b = body
+        while not done():
+            h = page_hints(b, len(out))
+            if h["next"]:
+                lst, b = get(urljoin(url, h["next"]))
+            elif h["cursor"]:
+                key, value = h["cursor"]
+                for name in dict.fromkeys(("cursor", key, "after")):
+                    lst, b2 = get(url, {name: value})
+                    if lst and any(ident(x) not in seen for x in lst):
+                        b = b2
+                        break
+                else:
+                    break
+            else:
+                break
+            if not add(lst):
+                break
+        # 2) большой размер страницы (если сайт ограничивает — берём его максимум)
+        size = {}
+        for name in ("limit", "per_page", "page_size", "pageSize", "size", "take"):
+            if done():
+                break
+            lst, b = get(url, {name: 1000})
+            value = 1000
+            if lst is None:
+                m = re.search(r"(?:less than or equal to|<=|не больше|max\w*)\D{0,20}(\d+)",
+                              json.dumps(b, ensure_ascii=False) if b else "", re.I)
+                value = int(m.group(1)) if m else 100
+                lst, _ = get(url, {name: value})
+            if add(lst):
+                size = {name: value}
+                break
+        # 3) номера страниц (с 1 или с 0) и 4) смещение — с найденным размером страницы
+        for make, start in ((lambda i: {"page": i}, 2), (lambda i: {"page": i}, 1),
+                            (lambda i: {"offset": len(out)}, 0), (lambda i: {"skip": len(out)}, 0)):
+            step = start
+            while not done():
+                lst, _ = get(url, {**size, **make(step)})
+                if not add(lst):
+                    break
+                step += 1
+        if len(out) > len(first_page):
+            log(f"Список {url}: на первой странице {len(first_page)}, всего {len(out)}")
+        return out
 
     def get_best_sales(self, product_id, count: int) -> list[dict]:
         params = {"product_id": product_id, "currency": self.cfg["currency"], "count": count}
@@ -941,13 +1301,31 @@ class Api:
         sales = [s for s in map(norm_sale, extract_list(data, "sales") or []) if s]
         return sorted((s for s in sales if s["price"] is not None), key=lambda s: s["price"])
 
-    def create_sale(self, item_id, product_id, price: float):
-        status, data = self.request("POST", "sales_api", body={"items": [{
-            "item_id": item_id, "product_id": product_id,
-            "price": round(price, 2), "currency": self.cfg["currency"],
-        }]})
-        if status not in (200, 201, 204):
-            raise self._fail("create_sale", status, data)
+    def create_sale(self, item: dict, price: float):
+        entry = {"item_id": item["item_id"], "product_id": item["product_id"],
+                 "price": round(price, 2), "currency": self.cfg["currency"]}
+        # поля, которые сайт уже требовал раньше, кладём сразу
+        for name in list(self.extra_fields):
+            value = find_field(item["raw"], name)
+            if value is not None:
+                entry.setdefault(name, value)
+        for _ in range(3):
+            status, data = self.request("POST", "sales_api", body={"items": [entry]})
+            if status in (200, 201, 204):
+                return
+            # сайт требует новое поле — берём его из данных предмета и повторяем
+            added = {}
+            for name in missing_fields(data):
+                if name not in entry:
+                    value = find_field(item["raw"], name)
+                    if value is not None:
+                        added[name] = value
+            if not added:
+                break
+            log(f"create_sale: сайт просит поля {sorted(added)} — добавляю из данных предмета")
+            entry.update(added)
+            self.extra_fields.update(added)
+        raise self._fail("create_sale", status, data)
 
     def cancel_sales(self, sale_ids: list):
         if not sale_ids:
@@ -1005,26 +1383,121 @@ def wait_for_login(api: Api, browser: Browser, timeout_s: float) -> str | None:
 
 # ---------- логика ----------
 
-def owned_by_product(items: list[dict], statuses: set) -> dict:
-    # product_id -> {name, qty}: сколько штук каждого товара у вас есть
-    result = {}
-    for item in items:
-        if item["status"] not in statuses:
+_USERISH_RE = re.compile(r"user|inventor|/me(/|$)|/my(/|$)|account|profile|owned|mine", re.I)
+
+
+def dict_lists(body, depth=0):
+    """Все списки словарей внутри ответа."""
+    if depth > 4:
+        return
+    if isinstance(body, list):
+        if body and all(isinstance(x, dict) for x in body):
+            yield body
+    elif isinstance(body, dict):
+        for v in body.values():
+            yield from dict_lists(v, depth + 1)
+
+
+def items_seen_by_site(captured: list[dict]) -> list[tuple[str, list]]:
+    """Ваши предметы из ответов, которые получил сам сайт (страница «Продажа» и др.)."""
+    found = []
+    for cap in captured:
+        if cap["method"] != "GET" or cap["status"] != 200:
             continue
-        entry = result.setdefault(item["product_id"], {"name": item["name"], "qty": 0})
-        entry["qty"] += 1
-    return result
+        path = urlparse(cap["url"]).path
+        if "sale" in path.lower() or not _USERISH_RE.search(path):
+            continue
+        try:
+            body = json.loads(cap["body"])
+        except ValueError:
+            continue
+        for lst in dict_lists(body):
+            raw = expand_items(lst)
+            good = [x for x in raw if norm_item(x)]
+            if good and len(good) * 2 >= len(raw):
+                found.append((cap["url"], good))
+    return found
 
 
-def _create_retry(api: Api, item_id, pid, price):
+def load_inventory(api: Api, browser: Browser, cfg: dict):
+    """Весь инвентарь и все ваши активные лоты."""
+    print("Сканирую инвентарь...")
+    items_error = None
+    try:
+        raw_items = expand_items(api.get_list("items_api", "items", "items"))
+    except Exception as e:
+        # старый адрес не отвечает — попробуем взять инвентарь со страницы сайта
+        if not cfg["learn_from_site"]:
+            raise
+        items_error = e
+        raw_items = []
+        print(f"  Список предметов по старому адресу не получен ({short(e)}) — беру со страницы сайта.")
+
+    if cfg["learn_from_site"]:
+        if browser.open_sell_page():
+            print("Открыл страницу «Продажа» — сверяю инвентарь с тем, что показывает сайт...")
+            browser.wait_quiet(min_s=3, quiet_s=2.5, max_s=20)
+            for _ in range(3):
+                browser.scroll_down()
+                time.sleep(1.5)
+            browser.wait_quiet(min_s=1, quiet_s=2, max_s=10)
+        else:
+            log("Ссылку «Продажа» на странице не нашёл")
+        ids = {str(it["item_id"]) for it in map(norm_item, raw_items) if it}
+        for url, lst in items_seen_by_site(list(browser.captured)):
+            new = [x for x in lst if str(norm_item(x)["item_id"]) not in ids]
+            if new:
+                ids.update(str(norm_item(x)["item_id"]) for x in new)
+                raw_items.extend(new)
+                print(f"  + {len(new)} шт. со страницы сайта ({urlparse(url).path})")
+                log(f"Предметы со страницы сайта: {url} (+{len(new)})")
+
+    if items_error is not None and not raw_items:
+        raise items_error
+    items, seen = [], set()
+    for x in raw_items:
+        it = norm_item(x)
+        if it and str(it["item_id"]) not in seen:
+            seen.add(str(it["item_id"]))
+            items.append(it)
+    if raw_items and not items:
+        print("Сайт вернул предметы в незнакомом формате — подробности в логе.")
+        log(f"Пример ответа: {json.dumps(raw_items[0], ensure_ascii=False)[:1500]}")
+
+    sales = [s for s in map(norm_sale, api.get_list("sales_user_api", "sales", "sales/user")) if s]
+    return items, [s for s in sales if sale_active(s)]
+
+
+def plan_products(items: list[dict], my_sales: list[dict], cfg: dict):
+    """product_id -> {name, items}: что (пере)выставляем; плюс что пропущено и почему."""
+    listed = {str(s["item_id"]) for s in my_sales if s["item_id"] is not None}
+    products, skipped = {}, Counter()
+    for it in items:
+        if str(it["item_id"]) not in listed:
+            if it["blocked"] or status_blocked(it["status"], cfg):
+                skipped[it["status"] or "заблокирован"] += 1
+                continue
+            if looks_listed(it["status"]):
+                # числится на продаже, но лота среди ваших нет — снять его нечем
+                skipped[f"{it['status']} без лота"] += 1
+                continue
+        products.setdefault(it["product_id"], {"name": it["name"], "items": []})["items"].append(it)
+    return products, skipped
+
+
+def _create_retry(api: Api, item: dict, price: float):
     for attempt in range(3):
         try:
-            api.create_sale(item_id, pid, price)
+            api.create_sale(item, price)
             return
+        except ApiError as e:
+            # 4xx — сайт отказал осознанно, повтор не поможет
+            if attempt == 2 or (e.status is not None and e.status < 500 and e.status != 429):
+                raise
         except Exception:
             if attempt == 2:
                 raise
-            time.sleep(1)
+        time.sleep(1)
 
 
 def target_price(peak: float, cfg: dict) -> float:
@@ -1035,122 +1508,100 @@ def target_price(peak: float, cfg: dict) -> float:
     return max(peak_cents - step, min_cents) / 100.0
 
 
-def reprice_one(api: Api, cfg: dict, pid, name, items, my_sales):
+def reprice_one(api: Api, cfg: dict, pid, name: str, prod_items: list[dict],
+                sales_by_item: dict, my_item_ids: set, my_sale_ids: set):
     """Один товар: прочитать рынок -> снять свои лоты -> выставить все штуки
-    по (максимум из топ-5) − 0.01. Возвращает (отчёт, изменено) или None."""
-    inv_statuses = {s.lower() for s in cfg["inventory_statuses"]}
-    sale_statuses = {s.lower() for s in cfg["on_sale_statuses"]}
+    по цене 5-го лота в топе (самого дорогого из топ-5) − 0.01. Возвращает (отчёт, изменено)."""
     top_n = int(cfg["top_n"])
-
-    my_sales_by_item = {s["item_id"]: s for s in my_sales if s["item_id"] is not None}
-    my_items = [i for i in items if i["product_id"] == pid and i["status"] in inv_statuses]
-    if not my_items:
-        return None
-    all_item_ids = [i["item_id"] for i in my_items]
-
-    my_sale_ids_for_product = []
-    prev_prices = {}
-    for i in my_items:
-        if i["status"] in sale_statuses and i["item_id"] in my_sales_by_item:
-            sale = my_sales_by_item[i["item_id"]]
-            my_sale_ids_for_product.append(sale["sale_id"])
-            prev_prices[i["item_id"]] = sale["price"]
-    removed = len(my_sale_ids_for_product)
+    listed = [(it, sales_by_item[str(it["item_id"])]) for it in prod_items
+              if str(it["item_id"]) in sales_by_item]
+    sale_ids = [s["sale_id"] for _, s in listed]
+    prev_prices = {str(it["item_id"]): s["price"] for it, s in listed}
+    removed = len(sale_ids)
+    count = len(prod_items)
 
     # а) рынок без своих лотов: берём с запасом на свои и выкидываем их.
     # Читаем ДО снятия, чтобы при ошибке чтения лоты не остались снятыми.
-    old_sale_ids = {s["sale_id"] for s in my_sales}
     best = api.get_best_sales(pid, count=top_n + removed)
-    market_prices = sorted(s["price"] for s in best if s["sale_id"] not in old_sale_ids)[:top_n]
+    market = sorted(s["price"] for s in best
+                    if str(s["sale_id"]) not in my_sale_ids and str(s["item_id"]) not in my_item_ids)[:top_n]
+    if not market:
+        return f"{name}: на рынке нет других продавцов -> оставил как было", False
 
-    if not market_prices:
-        return f"{name}: рынок пуст (конкурентов нет) -> оставил как было", False
-
-    peak = market_prices[-1]
+    peak = market[-1]
     target = target_price(peak, cfg)
+    top = f"{len(market)}-й в топе {peak:.2f}"
 
-    if (len(prev_prices) == len(all_item_ids)
-            and all(p is not None and round(p * 100) == round(target * 100) for p in prev_prices.values())):
-        return f"{name}: рынок топ-{len(market_prices)} max {peak:.2f} -> цена {target:.2f} уже стоит", False
+    if len(prev_prices) == count and all(
+            p is not None and round(p * 100) == round(target * 100) for p in prev_prices.values()):
+        return f"{name}: {top} -> {count} шт. уже стоят по {target:.2f}", False
 
     if cfg["dry_run"]:
-        return (f"{name}: [ТЕСТ] снял бы {removed} -> рынок топ-{len(market_prices)} max {peak:.2f} "
-                f"-> выставил бы {len(all_item_ids)} шт по {target:.2f}"), False
+        return f"{name}: [ТЕСТ] {top} -> снял бы {removed}, выставил бы {count} шт. по {target:.2f}", False
 
     # б) снимаем свои активные лоты этого товара
-    if my_sale_ids_for_product:
-        api.cancel_sales(my_sale_ids_for_product)
+    if sale_ids:
+        api.cancel_sales(sale_ids)
         time.sleep(0.4)
 
     # в) выставляем все штуки; ошибка на одной не мешает остальным
     failed = []
-    for item_id in all_item_ids:
+    for it in prod_items:
         try:
-            _create_retry(api, item_id, pid, target)
+            _create_retry(api, it, target)
         except Exception as e:
             failed.append(e)
     if failed:
-        raise RuntimeError(f"выставил {len(all_item_ids) - len(failed)} из {len(all_item_ids)} "
-                           f"по {target:.2f}; {short(failed[0], 100)}")
-
-    return (f"{name}: снял {removed} -> рынок топ-{len(market_prices)} max {peak:.2f} -> выставил "
-            f"{len(all_item_ids)} шт по {target:.2f} (на {cfg['undercut']:.2f} ниже)"), True
+        raise RuntimeError(f"выставил {count - len(failed)} из {count} по {target:.2f}; {short(failed[0], 100)}")
+    return f"{name}: {top} -> снял {removed}, выставил {count} шт. по {target:.2f}", True
 
 
-def run_pricing(api: Api, cfg: dict):
+def run_pricing(api: Api, browser: Browser, cfg: dict):
     t0 = time.time()
-    print("Загружаю ваши товары...")
-    items_raw = api.get_list("items_api", "items", "items")
-    sales_raw = api.get_list("sales_user_api", "sales", "sales/user")
-    items = [i for i in map(norm_item, items_raw) if i]
-    my_sales = [s for s in map(norm_sale, sales_raw) if s]
-    log(f"Предметов: {len(items_raw)} (разобрано {len(items)}), лотов: {len(sales_raw)} (разобрано {len(my_sales)})")
-    if items_raw:
-        log(f"Пример предмета: {json.dumps(items_raw[0], ensure_ascii=False)[:800]}")
-    if sales_raw:
-        log(f"Пример лота: {json.dumps(sales_raw[0], ensure_ascii=False)[:800]}")
-    if items_raw and not items:
-        print("Сайт вернул предметы в незнакомом формате — подробности в логе.")
+    items, my_sales = load_inventory(api, browser, cfg)
+    statuses = Counter(it["status"] or "без статуса" for it in items)
+    print(f"Предметов: {len(items)} ({', '.join(f'{k}: {v}' for k, v in statuses.most_common())}), "
+          f"ваших лотов на продаже: {len(my_sales)}")
+    log("Предметы (id | товар | название | статус):\n  " + "\n  ".join(
+        f"{it['item_id']} | {it['product_id']} | {it['name']} | {it['status']}"
+        f"{' | заблокирован' if it['blocked'] else ''}" for it in items))
+    if items:
+        log(f"Пример предмета: {json.dumps(items[0]['raw'], ensure_ascii=False)[:1500]}")
+    if my_sales:
+        log(f"Лоты: {[(s['sale_id'], s['item_id'], s['price']) for s in my_sales]}")
 
-    statuses = {s.lower() for s in cfg["inventory_statuses"]}
-    eligible = owned_by_product(items, statuses)
-    total = len(eligible)
-    if items and not total:
-        seen = sorted({i["status"] for i in items})
-        print(f"Предметов: {len(items)}, но ни один не в статусах {sorted(statuses)}.\n"
-              f"Статусы на сайте: {seen}. Их можно указать в inventory_statuses / "
-              f"on_sale_statuses в mm2pricer_config.json.")
+    products, skipped = plan_products(items, my_sales, cfg)
+    if skipped:
+        print("Пропускаю (выставлять нельзя): " + ", ".join(f"{k}: {v}" for k, v in skipped.items()))
+    sales_by_item = {str(s["item_id"]): s for s in my_sales if s["item_id"] is not None}
+    my_item_ids = {str(it["item_id"]) for it in items}
+    my_sale_ids = {str(s["sale_id"]) for s in my_sales}
+
+    total = len(products)
     workers = max(1, int(cfg["workers"]))
-    print(f"Товаров в работе: {total}. Обрабатываю ({workers} параллельно): "
-          f"чтение цен -> снятие лотов -> выставление...\n")
+    print(f"Товаров к выставлению: {total} ({sum(len(p['items']) for p in products.values())} шт.). "
+          f"Обрабатываю ({workers} параллельно): чтение цен -> снятие лотов -> выставление...\n")
 
-    changed = 0
-    errors = 0
-    done = 0
-
-    def worker(pid, info):
-        return reprice_one(api, cfg, pid, info["name"], items, my_sales)
-
+    changed = errors = done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(worker, pid, info): info for pid, info in eligible.items()}
+        futures = {pool.submit(reprice_one, api, cfg, pid, p["name"], p["items"],
+                               sales_by_item, my_item_ids, my_sale_ids): p
+                   for pid, p in products.items()}
         for fut in as_completed(futures):
-            info = futures[fut]
+            p = futures[fut]
             done += 1
             try:
-                result = fut.result()
+                report, did_change = fut.result()
             except Exception as e:
                 errors += 1
-                log(f"{info['name']}: {traceback.format_exc()}")
-                print(f"  [{done}/{total}] {info['name']}: ошибка ({short(e)})")
+                log(f"{p['name']}: {traceback.format_exc()}")
+                print(f"  [{done}/{total}] {p['name']}: ошибка ({short(e)})")
                 continue
-            if result is None:
-                continue
-            report, did_change = result
             if did_change:
                 changed += 1
             print(f"  [{done}/{total}] {report}")
 
-    print(f"\nГотово за {time.time() - t0:.1f} с. Переоценено: {changed}. Ошибок: {errors}.")
+    print(f"\nГотово за {time.time() - t0:.1f} с. Переоценено товаров: {changed}. Ошибок: {errors}.")
 
 
 def log_diagnostics(browser: Browser, api: Api | None):
@@ -1162,6 +1613,12 @@ def log_diagnostics(browser: Browser, api: Api | None):
     if api:
         log(f"Итоговые адреса API: {api.endpoints}")
         log(f"Авторизация: {api.auth[0]}, fetch из вкладки: {browser.cred_mode or 'нет'}")
+    # что сайт сам получал от своего API — по этому видно любые его изменения
+    last = {}
+    for cap in list(browser.captured):
+        last[(cap["method"], cap["url"])] = cap
+    for cap in list(last.values())[-80:]:
+        log(f"Ответ API сайту: {cap['method']} {cap['url']} -> {cap['status']}\n  {cap['body'][:3000]}")
 
 
 def main(argv=None):
@@ -1199,7 +1656,7 @@ def main(argv=None):
             return
 
         print(f"Вход подтверждён ({user}). Не трогайте окно браузера до конца работы.\n")
-        run_pricing(api, cfg)
+        run_pricing(api, browser, cfg)
     except KeyboardInterrupt:
         print("\nПрервано.")
     except Exception as e:

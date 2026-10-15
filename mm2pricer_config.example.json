@@ -16,9 +16,29 @@
     "in_inventory",
     "on_sale"
   ],
-  "on_sale_statuses": [
-    "on_sale"
+  "skip_status_words": [
+    "sold",
+    "withdraw",
+    "lock",
+    "hold",
+    "pend",
+    "trade",
+    "reserv",
+    "delet",
+    "cancel",
+    "block",
+    "ban",
+    "freez",
+    "transfer",
+    "deliver",
+    "process",
+    "wait",
+    "refund",
+    "expire",
+    "remov",
+    "escrow"
   ],
+  "learn_from_site": true,
   "dry_run": false,
   "browser_path": "",
   "auth_timeout_s": 900

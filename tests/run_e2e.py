@@ -19,7 +19,8 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PRICER = os.path.join(ROOT, "mm2_pricer.py")
 BROWSER = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MM2_BROWSER", "")
 
-EXPECTED = {"i1": 13.99, "i2": 13.99, "i3": 2.0, "i4": 9.99, "i5": 4.99}
+# i6 продан, i7 под трейд-локом — их выставлять нельзя
+EXPECTED = {"i1": 13.99, "i2": 13.99, "i3": 2.0, "i4": 9.99, "i5": 4.99, "i8": 3.39, "i9": 3.39}
 INITIAL = {"i1": 15.0, "i4": 9.99, "i5": 4.99}
 
 
@@ -64,7 +65,7 @@ def run(name, variant, transport="auto", dry_run=False):
     want = INITIAL if dry_run else EXPECTED
     ok = got == want and "Ошибок: 0" in proc.stdout
     if not dry_run:
-        # лот на P4 уже стоял по нужной цене — его не должны были трогать
+        # лот на P4 уже стоял по нужной цене, у P3 нет конкурентов — их не трогаем
         ok = ok and "s5" in site.state["sales"] and "s4" in site.state["sales"]
     print(f"цены после запуска: {got}")
     print(f"ожидалось:          {want}")
@@ -77,7 +78,8 @@ if __name__ == "__main__":
     results = {
         "старый сайт, запросы через вкладку": run("old/browser", "old"),
         "старый сайт, прямые запросы": run("old/requests", "old", transport="requests"),
-        "обновлённый сайт": run("new/auto", "new"),
+        "обновлённый сайт (статусы, страницы, account_id)": run("new/auto", "new"),
+        "инвентарь только на странице «Продажа»": run("new2/auto", "new2"),
         "обновлённый сайт, тестовый режим": run("new/dry-run", "new", dry_run=True),
     }
     print("\n===== ИТОГ =====")
