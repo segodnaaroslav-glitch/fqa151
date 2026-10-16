@@ -24,8 +24,8 @@ BROWSER = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MM2_BROWSER", ""
 # i6 продан, i7 под трейд-локом — их выставлять нельзя
 EXPECTED = {"i1": 13.99, "i2": 13.99, "i3": 2.0, "i4": 9.99, "i5": 4.99, "i8": 3.39, "i9": 3.39}
 INITIAL = {"i1": 15.0, "i4": 9.99, "i5": 4.99}
-# два маркета: старый o1 уже по 2.00; на новом n5 — с замороженного аккаунта,
-# у n6 нет конкурентов — их не выставляем
+# старый маркет выключен — o1 остаётся как был (2.00); на новом n5 — с замороженного
+# аккаунта, у n6 нет конкурентов — их не выставляем
 EXPECTED_MARKET = {"o1": 2.0, "n1": 23.99, "n2": 23.99, "n3": 43.99, "n7": 43.99, "n4": 5.09}
 LEARNED = os.path.join(tempfile.mkdtemp(prefix="mm2e2e-learned-"), "learned.json")
 
@@ -70,6 +70,8 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
         "inventory_api": f"{api}/api/none/{{user_id}}/items",
         "inventory_gates_api": f"{api}/api/none/{{user_id}}/gates",
         "market_sales_user_api": f"{api}/api/none/{{user_id}}/sales",
+        # в этих вариантах продажа идёт через старое API — включаем его
+        "old_market": True,
         "transport": transport,
         "dry_run": dry_run,
         "browser_path": BROWSER,
@@ -82,6 +84,7 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
         cfg["watch_interval_s"] = interval
     if variant == "market":
         mkt = f"http://mkt.dreampets.test:{p}"
+        cfg.pop("old_market")       # по умолчанию старый маркет выключен — его закрыли
         cfg.update({
             "profile_api": f"{api}/api/auth/v2/users/profile",
             "inventory_api": f"{mkt}/api/inventory/v1/users/{{user_id}}/items",
@@ -110,6 +113,9 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
     got = site.my_prices()
     want = want or (EXPECTED_MARKET if variant == "market" else INITIAL if dry_run else EXPECTED)
     ok = got == want and "Ошибок: 0" in proc.stdout and expect_text in proc.stdout
+    if variant == "market":
+        # старый маркет закрыт: программа не должна его ни показывать, ни трогать
+        ok = ok and "старый маркет" not in proc.stdout.lower()
     if not dry_run and variant != "market":
         # лот на P4 уже стоял по нужной цене, у P3 нет конкурентов — их не трогаем
         ok = ok and "s5" in site.state["sales"] and "s4" in site.state["sales"]

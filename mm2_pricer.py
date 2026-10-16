@@ -15,6 +15,10 @@ MM2 Pricer v2 — разовый репрайсер для dreampets.gg (вер�
 
 Никакого цикла: один запуск = одна смена цен.
 
+Что нового в v2.4:
+  * Старый маркет (mm2.dreampets.gg) закрыт — программа его больше не трогает
+    (включить обратно: "old_market": true в mm2pricer_config.json).
+
 Что нового в v2.1:
   * Предмет выставляется, если его статус не означает «продан / выведен /
     заблокирован» — переименование статусов на сайте больше не мешает.
@@ -69,7 +73,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -99,6 +103,10 @@ DEFAULT_CONFIG = {
                           "process", "wait", "refund", "expire", "remov", "escrow"],
     # открыть страницу «Продажа» и взять инвентарь так, как его видит сайт
     "learn_from_site": True,
+
+    # старый маркет (mm2.dreampets.gg) закрыт и больше не используется;
+    # true — снова работать и с ним
+    "old_market": False,
 
     # новый маркет ({user_id} подставляется из профиля)
     "new_market": True,
@@ -2013,13 +2021,14 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
         print("Сканирую инвентарь..." if open_sell_page else "Перечитываю инвентарь и лоты...")
     api.reset_discovery()   # страница уже загрузилась — прежние неудачные поиски не в счёт
 
-    # старый маркет
-    old_error = None
-    try:
-        old_raw = expand_items(api.get_list("items_api", "items", "items"))
-    except Exception as e:
-        old_error, old_raw = e, []
-        log(f"Старый маркет: список предметов не получен: {e}")
+    # старый маркет — только если он включён в настройках (сейчас он закрыт)
+    old_error, old_raw = None, []
+    if cfg["old_market"]:
+        try:
+            old_raw = expand_items(api.get_list("items_api", "items", "items"))
+        except Exception as e:
+            old_error = e
+            log(f"Старый маркет: список предметов не получен: {e}")
 
     if cfg["learn_from_site"] and open_sell_page:
         if browser.open_sell_page():
@@ -2047,9 +2056,14 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
         for url, lst in items_seen_by_site(list(browser.captured)):
             extra = [x for x in lst if str(norm_item(x)["item_id"]) not in known]
             if extra:
-                known.update(str(norm_item(x)["item_id"]) for x in extra)
                 # служба inventory — это новый маркет; остальное — старый
-                (new_raw if "/inventory/" in urlparse(url).path else old_raw).extend(extra)
+                if "/inventory/" in urlparse(url).path:
+                    new_raw.extend(extra)
+                elif cfg["old_market"]:
+                    old_raw.extend(extra)
+                else:
+                    continue
+                known.update(str(norm_item(x)["item_id"]) for x in extra)
                 log(f"Предметы со страницы сайта: {url} (+{len(extra)})")
     if old_error is not None and not old_raw and not new_raw:
         raise old_error
@@ -2068,7 +2082,7 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
 
     # ваши лоты
     sales = []
-    if old_raw or old_error is None:
+    if cfg["old_market"] and (old_raw or old_error is None):
         for s in map(norm_sale, api.get_list("sales_user_api", "sales", "sales/user")):
             if s:
                 s["market"] = "old"
@@ -2242,7 +2256,8 @@ def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: 
         del markets["new"]          # новый маркет остановлен — дальше его не трогаем
 
     if first:
-        print(f"Старый маркет: {_summary(items, my_sales, 'old')}")
+        if "old" in markets:
+            print(f"Старый маркет: {_summary(items, my_sales, 'old')}")
         if new_items:
             print(f"Новый маркет: {_summary(items, my_sales, 'new')}")
         log("Предметы (маркет | id | товар | название | статус):\n  " + "\n  ".join(
@@ -2258,7 +2273,7 @@ def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: 
         n = sum(len(p["items"]) for (mk, _), p in products.items() if mk == "new")
         if n and first:
             print(f"Новый маркет пропущен ({n} шт.): не знаю, как на нём выставлять.")
-        products = {k: p for k, p in products.items() if k[0] in markets}
+    products = {k: p for k, p in products.items() if k[0] in markets}
 
     sales_by_item = {str(s["item_id"]): s for s in my_sales if s["item_id"] is not None}
     my_item_ids = {str(it["item_id"]) for it in items}
@@ -2328,7 +2343,7 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
                 watch: bool = False, max_passes: int = 0):
     """Один проход или слежение за рынком: проверка, пауза, проверка..."""
     global _log_quiet
-    markets = {"old": OldMarket(api)}
+    markets = {"old": OldMarket(api)} if cfg["old_market"] else {}
     floors = {} if watch else None
     last_reports = {}
     number = 0

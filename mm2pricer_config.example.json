@@ -39,6 +39,7 @@
     "escrow"
   ],
   "learn_from_site": true,
+  "old_market": false,
   "new_market": true,
   "inventory_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/items",
   "inventory_gates_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/account-inventory-gates",
