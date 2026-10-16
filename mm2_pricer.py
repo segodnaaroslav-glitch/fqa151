@@ -44,6 +44,7 @@ import os
 import re
 import sys
 import json
+import math
 import time
 import base64
 import shutil
@@ -68,7 +69,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -106,6 +107,14 @@ DEFAULT_CONFIG = {
     "market_sales_user_api": "https://mm2-test.dreampets.gg/api/market/v1/users/{user_id}/sales",
     # сколько ждать, пока вы один раз покажете выставление на новом маркете
     "teach_timeout_s": 900,
+
+    # режим: ask — спросить при запуске, once — один проход, watch — следить постоянно
+    "mode": "ask",
+    # пауза между проверками рынка в режиме слежения, секунд
+    "watch_interval_s": 60,
+    # защита от ценовой войны: за один запуск цена товара не опускается ниже,
+    # чем на столько процентов от цены, выставленной на первой проверке (-1 — без защиты)
+    "max_drop_percent": 20,
 
     "dry_run": False,
     # auto — через вкладку браузера, при неудаче напрямую; browser; requests
@@ -168,6 +177,9 @@ _BEARER_RE = re.compile(r"(Bearer\s+)[^\s\"',]+", re.I)
 _TOKEN_FIELD_RE = re.compile(r"(\"[A-Za-z_]*(?:token|secret|password)[A-Za-z_]*\"\s*:\s*)\"[^\"]*\"", re.I)
 _log_file = None
 _log_lock = threading.Lock()
+_log_size = 0
+_LOG_LIMIT = 50_000_000      # при слежении лог не растёт бесконечно
+_log_quiet = False           # в повторных проверках не пишем тела удачных GET-запросов
 
 
 _EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -187,13 +199,20 @@ def open_log(path: str):
 
 
 def log(msg):
+    global _log_size
     if _log_file is None:
         return
     line = f"{time.strftime('%H:%M:%S')} {redact(str(msg))}\n"
     with _log_lock:
         try:
+            if _log_size + len(line) > _LOG_LIMIT:
+                _log_file.seek(0)
+                _log_file.truncate()
+                _log_size = 0
+                _log_file.write(f"{time.strftime('%H:%M:%S')} (начало лога обрезано — он стал слишком большим)\n")
             _log_file.write(line)
             _log_file.flush()
+            _log_size += len(line)
         except Exception:
             pass
 
@@ -931,9 +950,12 @@ class Browser:
             body = ""          # например, 204 без тела
             if meta[0] == "GET":
                 return
+        self._req_meta.pop(rid, None)
         if len(body) <= 5_000_000:
             self.captured.append({"method": meta[0], "url": meta[1], "status": meta[2], "body": body,
                                   "post": post, "seq": meta[6]})
+            if len(self.captured) > 1500:        # при долгом слежении не копим бесконечно
+                del self.captured[:500]
 
     def wait_quiet(self, min_s: float, quiet_s: float, max_s: float):
         """Ждёт, пока сайт перестанет делать запросы к API."""
@@ -947,6 +969,18 @@ class Browser:
                 break
         for t in list(self._body_threads):
             t.join(timeout=5)
+
+    def reload(self):
+        """Перезагружает вкладку сайта — сайт сам обновит вход (новый токен)."""
+        sess = self.primary(site_only=True)
+        if sess is None:
+            self.refresh()
+            sess = self.primary(site_only=True)
+        if sess is not None:
+            try:
+                sess.call("Page.reload", {"ignoreCache": True}, timeout=15)
+            except Exception as e:
+                log(f"Page.reload: {e}")
 
     def open_sell_page(self) -> str:
         """Нажимает «Продажа» в меню сайта. Возвращает, куда перешли ('' — не нашёл)."""
@@ -1145,6 +1179,10 @@ class Api:
         self._discover_at = {}
         self.extra_fields = set()            # поля, которые сайт требует при выставлении
         self.user_id = None
+        self.logged_in = False
+        self._auth_gen = 0                   # растёт при каждом восстановлении входа
+        self._reauth_lock = threading.Lock()
+        self._local = threading.local()
 
     # --- транспорт ---
 
@@ -1193,26 +1231,62 @@ class Api:
 
     def _send(self, method, url, params=None, body=None, timeout=20, raw: str | None = None):
         full = add_params(url, params)
-        headers = self.headers_for(url)
-        data = None
+        data = ctype = None
         if body is not None:
-            data = json.dumps(body)
-            headers["content-type"] = "application/json"
+            data, ctype = json.dumps(body), "application/json"
         elif raw is not None:
             data = raw
-            headers["content-type"] = ("application/json" if raw.lstrip()[:1] in "{["
-                                       else "application/x-www-form-urlencoded")
-        for attempt in range(4):
-            status, text = self._transport(method, full, headers, data, timeout)
-            retry = status == 429 or (method == "GET" and status in (502, 503, 504))
-            if not retry or attempt == 3:
-                break
-            time.sleep(1.5 * 2 ** attempt)
-        log(f"{method} {full} {data or ''} -> {status} {text[:2000]!r}")
+            ctype = "application/json" if raw.lstrip()[:1] in "{[" else "application/x-www-form-urlencoded"
+
+        def attempt_all():
+            headers = self.headers_for(url)
+            if ctype:
+                headers["content-type"] = ctype
+            for attempt in range(4):
+                status, text = self._transport(method, full, headers, data, timeout)
+                retry = status == 429 or (method == "GET" and status in (502, 503, 504))
+                if not retry or attempt == 3:
+                    return status, text
+                time.sleep(1.5 * 2 ** attempt)
+
+        gen = self._auth_gen
+        status, text = attempt_all()
+        if status in (401, 403) and self.logged_in and not getattr(self._local, "busy", False):
+            # возможно, истёк вход — восстанавливаем и повторяем один раз
+            if self.reauth(gen):
+                status, text = attempt_all()
+        if not _log_quiet or method != "GET" or not _ok(status):
+            log(f"{method} {full} {data or ''} -> {status} {text[:2000]!r}")
         try:
             return status, json.loads(text) if text else None
         except ValueError:
             return status, text
+
+    def reauth(self, seen_gen: int) -> bool:
+        """Сайт разлогинил (истёк токен): обновляем вкладку, а если не помогло — просим войти снова."""
+        with self._reauth_lock:
+            if self._auth_gen != seen_gen:
+                return True                      # пока ждали, другой поток уже восстановил вход
+            self._local.busy = True
+            try:
+                status, body = self._send("GET", self.endpoints["profile_api"])
+                if status == 200 and profile_name(body):
+                    return False                 # вход на месте — отказ 401/403 был по делу
+                print(f"  [{time.strftime('%H:%M:%S')}] Сайт разлогинил — обновляю страницу...")
+                log("Вход слетел — перезагружаю вкладку сайта")
+                self.browser.reload()
+                self.browser.wait_quiet(min_s=3, quiet_s=2, max_s=20)
+                name = detect_login(self, self.browser, try_cookies=True)
+                if not name:
+                    print("Сессия на сайте закончилась — войдите в аккаунт ещё раз в окне браузера.")
+                    name = wait_for_login(self, self.browser, self.cfg["auth_timeout_s"])
+                if not name:
+                    return False
+                self._auth_gen += 1
+                print(f"  [{time.strftime('%H:%M:%S')}] Вход восстановлен ({name}).")
+                return True
+            finally:
+                self._local.busy = False
 
     def request(self, method: str, key: str, params=None, body=None):
         url = self.endpoints[key]
@@ -1926,10 +2000,12 @@ def _captured_list(browser: Browser, path_re: str, field: str) -> list | None:
     return None
 
 
-def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool = True):
+def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool = True,
+                   use_site_items: bool = True, verbose: bool = True):
     """Весь инвентарь и все ваши активные лоты на обоих маркетах.
     Возвращает (предметы, лоты, замороженные аккаунты)."""
-    print("Сканирую инвентарь..." if open_sell_page else "Перечитываю инвентарь и лоты...")
+    if verbose:
+        print("Сканирую инвентарь..." if open_sell_page else "Перечитываю инвентарь и лоты...")
     api.reset_discovery()   # страница уже загрузилась — прежние неудачные поиски не в счёт
 
     # старый маркет
@@ -1942,7 +2018,8 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
 
     if cfg["learn_from_site"] and open_sell_page:
         if browser.open_sell_page():
-            print("Открыл страницу «Продажа» — сверяю инвентарь с тем, что показывает сайт...")
+            if verbose:
+                print("Открыл страницу «Продажа» — сверяю инвентарь с тем, что показывает сайт...")
             browser.wait_quiet(min_s=3, quiet_s=2.5, max_s=20)
             for _ in range(3):
                 browser.scroll_down()
@@ -1960,7 +2037,7 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
             new_raw = expand_items(api.collect_pages(url, "items", body))
         else:
             log(f"Новый маркет: инвентарь по {url} не получен ({status})")
-    if cfg["learn_from_site"]:
+    if cfg["learn_from_site"] and use_site_items:
         known = {str(it["item_id"]) for it in map(norm_item, old_raw + new_raw) if it}
         for url, lst in items_seen_by_site(list(browser.captured)):
             extra = [x for x in lst if str(norm_item(x)["item_id"]) not in known]
@@ -1980,7 +2057,7 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
                 seen.add(str(it["item_id"]))
                 it["market"] = market
                 items.append(it)
-    if (old_raw or new_raw) and not items:
+    if (old_raw or new_raw) and not items and verbose:
         print("Сайт вернул предметы в незнакомом формате — подробности в логе.")
         log(f"Пример ответа: {json.dumps((old_raw or new_raw)[0], ensure_ascii=False)[:1500]}")
 
@@ -2054,8 +2131,27 @@ def target_price(peak: float, cfg: dict) -> float:
     return max(peak_cents - step, min_cents) / 100.0
 
 
+_floor_lock = threading.Lock()
+
+
+def apply_floor(target: float, key, floors: dict | None, cfg: dict) -> tuple[float, str]:
+    """Защита от ценовой войны: первая цена товара за запуск — точка отсчёта,
+    ниже неё на max_drop_percent процентов не опускаемся."""
+    pct = cfg.get("max_drop_percent")
+    if floors is None or pct is None or pct < 0:
+        return target, ""
+    with _floor_lock:
+        floor = floors.get(key)
+        if floor is None:
+            floor = floors[key] = math.ceil(round(target * (100 - pct), 4)) / 100.0
+    if target < floor:
+        return floor, f" (держу нижнюю границу {floor:.2f}: −{pct:g}% от начальной)"
+    return target, ""
+
+
 def reprice_one(market, cfg: dict, pid, name: str, prod_items: list[dict],
-                sales_by_item: dict, my_item_ids: set, my_sale_ids: set, my_uid: str | None = None):
+                sales_by_item: dict, my_item_ids: set, my_sale_ids: set, my_uid: str | None = None,
+                floors: dict | None = None, floor_key=None):
     """Один товар: прочитать рынок -> снять свои лоты -> выставить все штуки
     по цене 5-го лота в топе (самого дорогого из топ-5) − 0.01. Возвращает (отчёт, изменено)."""
     top_n = int(cfg["top_n"])
@@ -2075,15 +2171,16 @@ def reprice_one(market, cfg: dict, pid, name: str, prod_items: list[dict],
         return f"{name}: на рынке нет других продавцов -> оставил как было", False
 
     peak = prices[-1]
-    target = target_price(peak, cfg)
+    target, held = apply_floor(target_price(peak, cfg), floor_key, floors, cfg)
     top = f"{len(prices)}-й в топе {peak:.2f}"
 
     if len(prev_prices) == count and all(
             p is not None and round(p * 100) == round(target * 100) for p in prev_prices.values()):
-        return f"{name}: {top} -> {count} шт. уже стоят по {target:.2f}", False
+        return f"{name}: {top} -> {count} шт. уже стоят по {target:.2f}{held}", False
 
     if cfg["dry_run"]:
-        return f"{name}: [ТЕСТ] {top} -> снял бы {removed}, выставил бы {count} шт. по {target:.2f}", False
+        return (f"{name}: [ТЕСТ] {top} -> снял бы {removed}, выставил бы {count} шт. "
+                f"по {target:.2f}{held}"), False
 
     # б) снимаем свои активные лоты этого товара
     if listed:
@@ -2099,7 +2196,7 @@ def reprice_one(market, cfg: dict, pid, name: str, prod_items: list[dict],
             failed.append(e)
     if failed:
         raise RuntimeError(f"выставил {count - len(failed)} из {count} по {target:.2f}; {short(failed[0], 120)}")
-    return f"{name}: {top} -> снял {removed}, выставил {count} шт. по {target:.2f}", True
+    return f"{name}: {top} -> снял {removed}, выставил {count} шт. по {target:.2f}{held}", True
 
 
 def _summary(items: list[dict], sales: list[dict], market: str) -> str:
@@ -2109,14 +2206,20 @@ def _summary(items: list[dict], sales: list[dict], market: str) -> str:
     return f"{len(its)} шт., товаров: {n_products}, ваших лотов: {n_sales}"
 
 
-def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str):
+def _now() -> str:
+    return time.strftime("%H:%M:%S")
+
+
+def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: dict,
+             first: bool, floors: dict | None, last_reports: dict, number: int):
+    """Одна проверка: инвентарь -> рынок -> перевыставление. Первая — подробно, остальные — только изменения."""
     t0 = time.time()
-    items, my_sales, frozen = load_inventory(api, browser, cfg)
+    items, my_sales, frozen = load_inventory(api, browser, cfg, open_sell_page=first,
+                                             use_site_items=first, verbose=first)
     new_items = [it for it in items if it["market"] == "new"]
 
-    # новый маркет: способ выставления — из файла, иначе учимся у вас
-    markets = {"old": OldMarket(api)}
-    if new_items:
+    # новый маркет: способ выставления — из файла, иначе учимся у вас (только на первой проверке)
+    if first and new_items:
         ops = load_learned(learned_path)
         if ops:
             print("Новый маркет: выставляю так, как запомнил раньше (mm2pricer_learned.json).")
@@ -2130,22 +2233,25 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str):
                 items, my_sales, frozen = load_inventory(api, browser, cfg, open_sell_page=False)
         if ops:
             markets["new"] = NewMarket(api, ops, cfg, learned_path)
+    if "new" in markets and markets["new"].stopped:
+        del markets["new"]          # новый маркет остановлен — дальше его не трогаем
 
-    print(f"Старый маркет: {_summary(items, my_sales, 'old')}")
-    if new_items:
-        print(f"Новый маркет: {_summary(items, my_sales, 'new')}")
-    log("Предметы (маркет | id | товар | название | статус):\n  " + "\n  ".join(
-        f"{it['market']} | {it['item_id']} | {it['product_id']} | {it['name']} | {it['status']}"
-        f"{' | заблокирован' if it['blocked'] else ''}" for it in items))
-    if my_sales:
-        log(f"Лоты: {[(s['market'], s['sale_id'], s['item_id'], s['price']) for s in my_sales]}")
+    if first:
+        print(f"Старый маркет: {_summary(items, my_sales, 'old')}")
+        if new_items:
+            print(f"Новый маркет: {_summary(items, my_sales, 'new')}")
+        log("Предметы (маркет | id | товар | название | статус):\n  " + "\n  ".join(
+            f"{it['market']} | {it['item_id']} | {it['product_id']} | {it['name']} | {it['status']}"
+            f"{' | заблокирован' if it['blocked'] else ''}" for it in items))
+        if my_sales:
+            log(f"Лоты: {[(s['market'], s['sale_id'], s['item_id'], s['price']) for s in my_sales]}")
 
     products, skipped = plan_products(items, my_sales, cfg, frozen)
-    if skipped:
+    if first and skipped:
         print("Пропускаю: " + ", ".join(f"{k}: {v} шт." for k, v in skipped.items()))
     if "new" not in markets:
         n = sum(len(p["items"]) for (mk, _), p in products.items() if mk == "new")
-        if n:
+        if n and first:
             print(f"Новый маркет пропущен ({n} шт.): не знаю, как на нём выставлять.")
         products = {k: p for k, p in products.items() if k[0] in markets}
 
@@ -2155,37 +2261,98 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str):
 
     total = len(products)
     workers = max(1, int(cfg["workers"]))
-    print(f"Товаров к выставлению: {total} ({sum(len(p['items']) for p in products.values())} шт.). "
-          f"Обрабатываю ({workers} параллельно): чтение цен -> снятие лотов -> выставление...\n"
-          f"Не трогайте окно браузера до конца работы.\n")
+    if first:
+        print(f"Товаров к выставлению: {total} ({sum(len(p['items']) for p in products.values())} шт.). "
+              f"Обрабатываю ({workers} параллельно): чтение цен -> снятие лотов -> выставление...\n"
+              f"Не трогайте окно браузера до конца работы.\n")
 
     changed = errors = done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {}
-        for (mk, pid), p in products.items():
-            market = markets[mk]
+        for key, p in products.items():
+            market = markets[key[0]]
             name = p["name"] + market.tag
-            fut = pool.submit(reprice_one, market, cfg, pid, name, p["items"],
-                              sales_by_item, my_item_ids, my_sale_ids, api.user_id)
-            futures[fut] = name
+            fut = pool.submit(reprice_one, market, cfg, key[1], name, p["items"],
+                              sales_by_item, my_item_ids, my_sale_ids, api.user_id, floors, key)
+            futures[fut] = (key, name)
         for fut in as_completed(futures):
-            name = futures[fut]
+            key, name = futures[fut]
             done += 1
+            failed = False
             try:
                 report, did_change = fut.result()
             except Exception as e:
                 errors += 1
+                failed = True
                 log(f"{name}: {traceback.format_exc()}")
-                print(f"  [{done}/{total}] {name}: ошибка ({short(e)})")
-                continue
+                report, did_change = f"{name}: ошибка ({short(e)})", False
             if did_change:
                 changed += 1
-            print(f"  [{done}/{total}] {report}")
+            # на повторных проверках показываем только перевыставления и новые ошибки
+            # (в тестовом режиме — новые «выставил бы»)
+            if first:
+                print(f"  [{done}/{total}] {report}")
+            elif did_change or ((failed or cfg["dry_run"]) and report != last_reports.get(key)):
+                print(f"  [{_now()}] {report}")
+            last_reports[key] = report
 
     stopped = getattr(markets.get("new"), "stopped", None)
     if stopped:
         print(f"\nНовый маркет: {stopped}.")
-    print(f"\nГотово за {time.time() - t0:.1f} с. Переоценено товаров: {changed}. Ошибок: {errors}.")
+    if first:
+        print(f"\nГотово за {time.time() - t0:.1f} с. Переоценено товаров: {changed}. Ошибок: {errors}.")
+    else:
+        print(f"[{_now()}] Проверка №{number}: переставлено {changed}, "
+              f"без изменений {total - changed - errors}, ошибок {errors}.")
+
+
+def wait_or_stop(browser: Browser, seconds: float) -> bool:
+    """Пауза между проверками. True — пора остановиться (Enter или закрыли браузер)."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if enter_pressed():
+            return True
+        if browser.proc and browser.proc.poll() is not None:
+            print("Окно браузера закрыто.")
+            return True
+        time.sleep(0.5)
+    return False
+
+
+def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
+                watch: bool = False, max_passes: int = 0):
+    """Один проход или слежение за рынком: проверка, пауза, проверка..."""
+    global _log_quiet
+    markets = {"old": OldMarket(api)}
+    floors = {} if watch else None
+    last_reports = {}
+    number = 0
+    while True:
+        number += 1
+        first = number == 1
+        try:
+            run_pass(api, browser, cfg, learned_path, markets, first, floors, last_reports, number)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            if first or not watch:
+                raise
+            # сбой одной проверки (сеть, сайт) не останавливает слежение
+            log(traceback.format_exc())
+            print(f"[{_now()}] Проверка №{number}: ошибка ({short(e)}) — попробую в следующий раз.")
+        if not watch or (max_passes and number >= max_passes):
+            return
+        if first:
+            pct = cfg.get("max_drop_percent")
+            guard = (f" Ниже −{pct:g}% от первой цены товара не опускаюсь."
+                     if pct is not None and pct >= 0 else "")
+            print(f"\nСлежу за рынком: проверяю каждые {cfg['watch_interval_s']:g} с и переставляю, "
+                  f"если 5-й лот в топе изменился.{guard}\n"
+                  f"Показываю только изменения. Чтобы остановить — нажмите Enter (или Ctrl+C).\n")
+            _log_quiet = True       # дальше в лог — только изменения и ошибки
+        if wait_or_stop(browser, float(cfg["watch_interval_s"])):
+            print("Останавливаю слежение.")
+            return
 
 
 def log_diagnostics(browser: Browser, api: Api | None):
@@ -2205,6 +2372,20 @@ def log_diagnostics(browser: Browser, api: Api | None):
         log(f"Ответ API сайту: {cap['method']} {cap['url']} -> {cap['status']}\n  {cap['body'][:3000]}")
 
 
+def ask_mode() -> str:
+    if not (sys.stdin and sys.stdin.isatty()):
+        return "once"
+    print("Как работать?\n"
+          "  1 — переставить цены один раз и выйти\n"
+          "  2 — следить за рынком и переставлять цены постоянно (пока не остановите)")
+    try:
+        answer = input("Введите 1 или 2 и нажмите Enter [2]: ").strip()
+    except Exception:
+        return "once"
+    print()
+    return "once" if answer == "1" else "watch"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="MM2 Pricer для dreampets.gg")
     parser.add_argument("--dry-run", action="store_true", help="только показать, ничего не менять")
@@ -2213,13 +2394,23 @@ def main(argv=None):
     parser.add_argument("--learned", default=LEARNED_PATH,
                         help="где хранить, как выставлять на новом маркете")
     parser.add_argument("--no-pause", action="store_true", help="не ждать Enter в конце")
+    parser.add_argument("--watch", action="store_true", help="следить за рынком постоянно")
+    parser.add_argument("--once", action="store_true", help="переставить цены один раз и выйти")
+    parser.add_argument("--passes", type=int, default=0, help=argparse.SUPPRESS)
     args, _ = parser.parse_known_args(argv)
 
-    print(f"=== MM2 Pricer v{VERSION} ===")
-    print("Одноразовый запуск: вход -> смена цен -> выход.\n")
+    print(f"=== MM2 Pricer v{VERSION} ===\n")
     cfg = load_config(args.config)
     if args.dry_run:
         cfg["dry_run"] = True
+    mode = "watch" if args.watch else "once" if args.once else cfg["mode"]
+    if mode not in ("once", "watch"):
+        mode = ask_mode()
+    if mode == "watch":
+        print(f"Режим: слежу за рынком и переставляю цены каждые {cfg['watch_interval_s']:g} с, "
+              f"пока не остановите.\n")
+    else:
+        print("Режим: один раз — вход -> смена цен -> выход.\n")
     if cfg["dry_run"]:
         print("ТЕСТОВЫЙ РЕЖИМ: цены не меняются, только показываю, что было бы сделано.\n")
     open_log(args.log)
@@ -2242,7 +2433,8 @@ def main(argv=None):
             return
 
         print(f"Вход подтверждён ({user}).\n")
-        run_pricing(api, browser, cfg, args.learned)
+        api.logged_in = True
+        run_pricing(api, browser, cfg, args.learned, watch=(mode == "watch"), max_passes=args.passes)
     except KeyboardInterrupt:
         print("\nПрервано.")
     except Exception as e:

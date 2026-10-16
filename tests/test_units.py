@@ -170,6 +170,19 @@ def test_learn_price_in_kopecks():
     assert nm._values(price=13.99)["price"] == 1399
 
 
+def test_apply_floor():
+    cfg = dict(m.DEFAULT_CONFIG, max_drop_percent=20)
+    floors = {}
+    assert m.apply_floor(23.99, "k", floors, cfg) == (23.99, "")          # первая цена — точка отсчёта
+    assert floors["k"] == 19.20
+    assert m.apply_floor(21.00, "k", floors, cfg) == (21.00, "")          # в пределах 20% — следуем рынку
+    price, note = m.apply_floor(14.99, "k", floors, cfg)                  # обвал — держим границу
+    assert price == 19.20 and "19.20" in note
+    assert m.apply_floor(30.00, "k", floors, cfg) == (30.00, "")          # вверх — без ограничений
+    assert m.apply_floor(1.0, "k", None, cfg) == (1.0, "")                # разовый запуск — без границы
+    assert m.apply_floor(1.0, "z", {}, dict(cfg, max_drop_percent=-1)) == (1.0, "")
+
+
 def test_redact():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
     text = m.redact(f'Bearer abc {jwt} {{"refresh_token": "opaque", "name": "x", "email": "a.b@mail.ru"}}')

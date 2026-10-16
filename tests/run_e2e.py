@@ -8,6 +8,8 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mock_site import MockSite  # noqa: E402
@@ -28,7 +30,25 @@ EXPECTED_MARKET = {"o1": 2.0, "n1": 23.99, "n2": 23.99, "n3": 43.99, "n7": 43.99
 LEARNED = os.path.join(tempfile.mkdtemp(prefix="mm2e2e-learned-"), "learned.json")
 
 
-def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text=""):
+# слежение: после первой проверки конкурент сбивает цены, а сайт «разлогинивает»
+EXPECTED_WATCH = {"o1": 2.0, "n1": 19.20, "n2": 19.20, "n3": 43.49, "n7": 43.49, "n4": 5.09}
+
+
+def competitor_and_logout(site):
+    """Ждёт, пока программа выставит Bauble по 23.99, затем: на Bauble обвал (15.00 — ниже
+    границы −20%), на Bunnies лот 43.50 (5-й в топе станет 43.50), и все токены сайта истекают."""
+    deadline = time.time() + 120
+    while time.time() < deadline and site.my_prices().get("n1") != 23.99:
+        time.sleep(0.2)
+    with site.lock:
+        for i in range(5):
+            site.state["sales"][f"dump{i}"] = {"product": "N1", "item": f"dumpitem{i}", "price": 15.00, "user": "U7"}
+        site.state["sales"]["under"] = {"product": "N2", "item": "underitem", "price": 43.50, "user": "U7"}
+        site.tokens.clear()
+
+
+def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="",
+        extra_args=(), during=None, want=None, interval=None):
     site = MockSite(variant, demo=demo)
     p = site.port
     if variant == "old":
@@ -58,6 +78,8 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
         "auth_timeout_s": 60,
         "teach_timeout_s": 60,
     }
+    if interval is not None:
+        cfg["watch_interval_s"] = interval
     if variant == "market":
         mkt = f"http://mkt.dreampets.test:{p}"
         cfg.update({
@@ -75,15 +97,18 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
     with open(cfg_path, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
     print(f"\n===== {name} =====", flush=True)
+    helper = threading.Thread(target=during, args=(site,), daemon=True) if during else None
+    if helper:
+        helper.start()
     proc = subprocess.run(
         [sys.executable, "-I", PRICER, "--config", cfg_path, "--log", log_path, "--no-pause",
-         "--learned", LEARNED],
-        capture_output=True, text=True, encoding="utf-8", timeout=240,
+         "--learned", LEARNED, *extra_args],
+        capture_output=True, text=True, encoding="utf-8", timeout=300,
     )
     print(proc.stdout + proc.stderr)
     site.stop()
     got = site.my_prices()
-    want = EXPECTED_MARKET if variant == "market" else INITIAL if dry_run else EXPECTED
+    want = want or (EXPECTED_MARKET if variant == "market" else INITIAL if dry_run else EXPECTED)
     ok = got == want and "Ошибок: 0" in proc.stdout and expect_text in proc.stdout
     if not dry_run and variant != "market":
         # лот на P4 уже стоял по нужной цене, у P3 нет конкурентов — их не трогаем
@@ -106,6 +131,10 @@ if __name__ == "__main__":
             "market/teach", "market", expect_text="Запомнил, как выставлять"),
         "два маркета: по запомненному, без показа": run(
             "market/saved", "market", demo=False, expect_text="как запомнил раньше"),
+        "слежение: конкурент сбил цену, граница −20%, сайт разлогинил": run(
+            "market/watch", "market", demo=False, extra_args=("--watch", "--passes", "4"),
+            during=competitor_and_logout, want=EXPECTED_WATCH, interval=2,
+            expect_text="Вход восстановлен"),
     }
     print("\n===== ИТОГ =====")
     for k, v in results.items():

@@ -44,6 +44,9 @@
   "inventory_gates_api": "https://mm2-test.dreampets.gg/api/inventory/v1/users/{user_id}/account-inventory-gates",
   "market_sales_user_api": "https://mm2-test.dreampets.gg/api/market/v1/users/{user_id}/sales",
   "teach_timeout_s": 900,
+  "mode": "ask",
+  "watch_interval_s": 60,
+  "max_drop_percent": 20,
   "dry_run": false,
   "browser_path": "",
   "auth_timeout_s": 900
