@@ -1093,21 +1093,26 @@ class Browser:
             for res in node.get("resources", []):
                 if res.get("type") != "Script":
                     continue
+                text = ""
                 try:
                     c = sess.call("Page.getResourceContent",
                                   {"frameId": frame_id, "url": res["url"]}, timeout=15)
-                    if not c.get("base64Encoded"):
-                        texts.append(c.get("content", ""))
-                        continue
+                    text = c.get("content", "")
+                    if c.get("base64Encoded"):
+                        text = base64.b64decode(text).decode("utf-8", "replace")
                 except Exception as e:
                     log(f"Page.getResourceContent {res['url']}: {e}")
-                try:
-                    status, text = self.fetch("GET", res["url"], {}, None, 15, api=False)
-                    if status == 200:
-                        texts.append(text)
-                except Exception:
-                    pass
+                if not text.strip():
+                    # браузер не отдал текст (бывает на Windows) — скачиваем скрипт заново
+                    try:
+                        status, fetched = self.fetch("GET", res["url"], {}, None, 15, api=False)
+                        text = fetched if status == 200 else ""
+                    except Exception as e:
+                        log(f"Скрипт сайта {res['url']}: {e}")
+                if text:
+                    texts.append(text)
             stack.extend(node.get("childFrames", []))
+        log(f"Код сайта: прочитано скриптов {len(texts)}, {sum(len(t) for t in texts)} символов")
         return texts
 
     # --- выход ---
@@ -2046,7 +2051,7 @@ def load_inventory(api: Api, browser: Browser, cfg: dict, open_sell_page: bool =
                 # служба inventory — это новый маркет; остальное — старый
                 (new_raw if "/inventory/" in urlparse(url).path else old_raw).extend(extra)
                 log(f"Предметы со страницы сайта: {url} (+{len(extra)})")
-    if old_error is not None and not new_raw:
+    if old_error is not None and not old_raw and not new_raw:
         raise old_error
 
     items, seen = [], set()
