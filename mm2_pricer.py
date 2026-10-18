@@ -15,6 +15,10 @@ MM2 Pricer v2 — разовый репрайсер для dreampets.gg (вер�
 
 Никакого цикла: один запуск = одна смена цен.
 
+Что нового в v2.6:
+  * Можно выбрать, от какого лота в топе считать цену: 1-й (самый дешёвый),
+    2-й, 3-й, 4-й или 5-й — вторым вопросом в меню или флагом --lot N.
+
 Что нового в v2.5:
   * «Снять всё»: пункт меню 5 (или --cancel-all) снимает с продажи все ваши
     лоты сразу; в режиме слежения то же делает клавиша 0.
@@ -79,7 +83,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.5"
+VERSION = "2.6"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -97,6 +101,7 @@ DEFAULT_CONFIG = {
     "currency": "rub",
     "min_listing_price": 2.0,
     "undercut": 0.01,
+    # от какого по дешевизне лота считать цену: 1 — самый дешёвый ... 5 — пятый
     "top_n": 5,
     "workers": 10,
 
@@ -125,7 +130,7 @@ DEFAULT_CONFIG = {
     # режим: ask — спросить при запуске, once — один проход, watch — следить постоянно,
     # cancel — снять с продажи все лоты
     "mode": "ask",
-    # true — ставить по минимальной цене (самый дешёвый лот − undercut) вместо top_n-го
+    # true — ставить по минимальной цене (самый дешёвый лот − undercut), то же что top_n = 1
     "cheapest": False,
     # пауза между проверками рынка в режиме слежения, секунд
     "watch_interval_s": 60,
@@ -2406,8 +2411,7 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
             pct = cfg.get("max_drop_percent")
             guard = (f" Ниже −{pct:g}% от первой цены товара не опускаюсь."
                      if pct is not None and pct >= 0 else "")
-            what = ("самый дешёвый лот" if int(cfg["top_n"]) == 1
-                    else f"{int(cfg['top_n'])}-й лот в топе")
+            what = lot_rule(cfg).split(" − ")[0]
             print(f"\nСлежу за рынком: проверяю каждые {cfg['watch_interval_s']:g} с и переставляю, "
                   f"если {what} изменился.{guard}\n"
                   f"Показываю только изменения.\n"
@@ -2511,25 +2515,44 @@ def log_diagnostics(browser: Browser, api: Api | None):
         log(f"Ответ API сайту: {cap['method']} {cap['url']} -> {cap['status']}\n  {cap['body'][:3000]}")
 
 
-def ask_mode(cfg: dict) -> tuple[str, bool]:
-    """Меню при запуске. Возвращает (режим, по минимальной цене)."""
+def lot_rule(cfg: dict) -> str:
+    n = int(cfg["top_n"])
+    lot = "самый дешёвый лот" if n == 1 else f"{n}-й лот в топе"
+    return f"{lot} − {cfg['undercut']:.2f}"
+
+
+def ask_lot(cfg: dict) -> int:
+    """От какого по дешевизне лота считать цену."""
+    default = int(cfg["top_n"])
+    print(f"От какого лота в топе считать цену? Ваша цена = этот лот − {cfg['undercut']:.2f}\n"
+          "  1 — самый дешёвый (минимальная цена)\n"
+          "  2 — 2-й по дешевизне\n"
+          "  3 — 3-й\n"
+          "  4 — 4-й\n"
+          "  5 — 5-й")
+    try:
+        answer = input(f"Введите номер и нажмите Enter [{default}]: ").strip()
+    except Exception:
+        answer = ""
+    print()
+    return int(answer) if answer.isdigit() and 1 <= int(answer) <= 20 else default
+
+
+def ask_mode(cfg: dict) -> tuple[str, int | None]:
+    """Меню при запуске. Возвращает (режим, номер лота в топе или None)."""
     if not (sys.stdin and sys.stdin.isatty()):
-        return "once", False
-    top = f"{int(cfg['top_n'])}-й лот в топе − {cfg['undercut']:.2f}"
-    low = f"самый дешёвый лот − {cfg['undercut']:.2f}"
+        return "once", None
     print("Что сделать?\n"
-          f"  1 — переставить цены один раз ({top})\n"
-          f"  2 — следить за рынком и переставлять постоянно ({top})\n"
-          f"  3 — переставить один раз по минимальной цене ({low})\n"
-          f"  4 — следить за рынком по минимальной цене ({low})\n"
-          "  5 — снять с продажи все свои лоты")
+          "  1 — переставить цены один раз\n"
+          "  2 — следить за рынком и переставлять постоянно\n"
+          "  3 — снять с продажи все свои лоты")
     try:
         answer = input("Введите номер и нажмите Enter [2]: ").strip()
     except Exception:
-        return "once", False
+        return "once", None
     print()
-    return {"1": ("once", False), "3": ("once", True), "4": ("watch", True),
-            "5": ("cancel", False)}.get(answer, ("watch", False))
+    mode = {"1": "once", "3": "cancel"}.get(answer, "watch")
+    return mode, (None if mode == "cancel" else ask_lot(cfg))
 
 
 def main(argv=None):
@@ -2542,8 +2565,10 @@ def main(argv=None):
     parser.add_argument("--no-pause", action="store_true", help="не ждать Enter в конце")
     parser.add_argument("--watch", action="store_true", help="следить за рынком постоянно")
     parser.add_argument("--once", action="store_true", help="переставить цены один раз и выйти")
+    parser.add_argument("--lot", type=int, default=0,
+                        help="от какого лота в топе считать цену: 1 — самый дешёвый ... 5 — пятый")
     parser.add_argument("--min", action="store_true",
-                        help="по минимальной цене: самый дешёвый лот на рынке минус копейка")
+                        help="по минимальной цене: самый дешёвый лот на рынке минус копейка (= --lot 1)")
     parser.add_argument("--cancel-all", action="store_true", help="снять с продажи все свои лоты")
     parser.add_argument("--passes", type=int, default=0, help=argparse.SUPPRESS)
     args, _ = parser.parse_known_args(argv)
@@ -2554,14 +2579,13 @@ def main(argv=None):
         cfg["dry_run"] = True
     mode = ("cancel" if args.cancel_all else "watch" if args.watch else "once" if args.once
             else cfg["mode"])
-    cheapest = args.min or bool(cfg["cheapest"])
+    lot = args.lot or (1 if (args.min or cfg["cheapest"]) else 0)
     if mode not in ("once", "watch", "cancel"):
-        mode, menu_cheapest = ask_mode(cfg)
-        cheapest = cheapest or menu_cheapest
-    if cheapest:
-        cfg["top_n"] = 1            # «по минимальной цене»: от самого дешёвого лота
-    rule = (f"самый дешёвый лот − {cfg['undercut']:.2f}" if cheapest
-            else f"{int(cfg['top_n'])}-й лот в топе − {cfg['undercut']:.2f}")
+        mode, menu_lot = ask_mode(cfg)
+        lot = lot or menu_lot or 0
+    if lot > 0:
+        cfg["top_n"] = lot          # 1 — от самого дешёвого лота («по минимальной цене»)
+    rule = lot_rule(cfg)
     if mode == "cancel":
         print("Режим: снять с продажи все ваши лоты.\n")
     elif mode == "watch":

@@ -183,6 +183,13 @@ def test_apply_floor():
     assert m.apply_floor(1.0, "z", {}, dict(cfg, max_drop_percent=-1)) == (1.0, "")
 
 
+def test_lot_rule():
+    cfg = dict(m.DEFAULT_CONFIG)
+    assert m.lot_rule(dict(cfg, top_n=1)) == "самый дешёвый лот − 0.01"
+    assert m.lot_rule(dict(cfg, top_n=3)) == "3-й лот в топе − 0.01"
+    assert m.target_price(22.00, cfg) == 21.99
+
+
 def test_redact():
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl"
     text = m.redact(f'Bearer abc {jwt} {{"refresh_token": "opaque", "name": "x", "email": "a.b@mail.ru"}}')

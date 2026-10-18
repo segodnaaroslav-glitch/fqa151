@@ -49,6 +49,8 @@ def competitor_and_logout(site):
 
 # по минимальной цене: самый дешёвый чужой лот минус копейка
 EXPECTED_MIN = {"o1": 2.0, "n1": 19.99, "n2": 19.99, "n3": 39.99, "n7": 39.99, "n4": 4.99}
+# от 3-го лота: Bauble 22.00, Bunnies 42.00; у Candy конкурентов двое — берётся 2-й (5.10)
+EXPECTED_LOT3 = {"o1": 2.0, "n1": 21.99, "n2": 21.99, "n3": 41.99, "n7": 41.99, "n4": 5.09}
 
 
 def more_own_lots(site):
@@ -153,6 +155,9 @@ if __name__ == "__main__":
         "по минимальной цене": run(
             "market/min", "market", demo=False, extra_args=("--once", "--min"),
             want=EXPECTED_MIN, expect_text="минимум на рынке"),
+        "от 3-го лота в топе": run(
+            "market/lot3", "market", demo=False, extra_args=("--once", "--lot", "3"),
+            want=EXPECTED_LOT3, expect_text="3-й в топе 22.00"),
         "снять всё": run(
             "market/cancel", "market", demo=False, extra_args=("--cancel-all",),
             setup=more_own_lots, want={"o1": 2.0}, expect_text="Снято лотов: 3 из 3"),
