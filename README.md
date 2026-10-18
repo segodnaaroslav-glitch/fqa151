@@ -1,5 +1,11 @@
 # MM2 Pricer v2 — репрайсер для dreampets.gg
 
+> **Новое: StarPets Helper** — расширение для браузера для starpets.gg: общая
+> стоимость ваших товаров и она же минус 20%, смена цены выбранных товаров на
+> минимальную цену рынка и мини-окно с новыми ценами. Скачать:
+> https://github.com/segodnaaroslav-glitch/fqa151/releases/download/starpets-helper-latest/StarPetsHelper.zip —
+> установка и подробности в [starpets_extension/README.md](starpets_extension/README.md).
+
 Открывает браузер → вы входите в аккаунт → программа переставляет цены на все
 ваши товары. При запуске она спрашивает режим:
 
@@ -135,3 +141,5 @@
 | `mm2pricer_config.example.json` | пример настроек |
 | `build.bat` | сборка exe на Windows (нужен Python 3.13) |
 | `tests/` | проверка на локальной имитации сайта: `python tests/test_units.py`, `python tests/run_e2e.py` |
+| `starpets_extension/` | расширение StarPets Helper для starpets.gg ([описание](starpets_extension/README.md)) |
+| `tests/starpets/` | проверка расширения: `node --test tests/starpets/core.test.js`, `xvfb-run node tests/starpets/e2e.js` |

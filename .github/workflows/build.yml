@@ -68,3 +68,38 @@ jobs:
           gh release create "$tag" dist/MM2Pricer.exe --target "$GITHUB_SHA" \
             --title "MM2 Pricer v2" \
             --notes "Скачайте MM2Pricer.exe и запустите. Тестовый запуск без изменения цен: MM2Pricer.exe --dry-run. Сборка из ${GITHUB_SHA::7}."
+
+  extension:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Unit tests (StarPets Helper)
+        run: node --test tests/starpets/core.test.js
+      - name: Install Playwright Chromium
+        run: |
+          npm install --no-save --no-package-lock playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: End-to-end tests (extension in Chromium, mock site)
+        run: xvfb-run -a node tests/starpets/e2e.js
+      - name: Pack extension
+        run: cd starpets_extension && zip -r ../StarPetsHelper.zip . -x README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: StarPetsHelper
+          path: StarPetsHelper.zip
+      # StarPetsHelper.zip для скачивания по прямой ссылке
+      - name: Publish release
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=starpets-helper-latest
+          gh release delete "$tag" --cleanup-tag --yes || true
+          gh release create "$tag" StarPetsHelper.zip --target "$GITHUB_SHA" \
+            --title "StarPets Helper" \
+            --notes "Расширение для starpets.gg. Распакуйте StarPetsHelper.zip, откройте chrome://extensions, включите «Режим разработчика» и нажмите «Загрузить распакованное расширение». Сборка из ${GITHUB_SHA::7}."

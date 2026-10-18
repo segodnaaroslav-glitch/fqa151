@@ -5,3 +5,5 @@ __pycache__/
 mm2pricer_log.txt
 mm2pricer_config.json
 e2e-logs/
+node_modules/
+StarPetsHelper.zip

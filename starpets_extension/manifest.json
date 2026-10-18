@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "StarPets Helper",
+  "version": "1.0.0",
+  "description": "Общая стоимость ваших товаров на StarPets и она же минус 20%; смена цены выбранных товаров на минимальную цену рынка.",
+  "permissions": ["storage"],
+  "background": { "service_worker": "background.js" },
+  "action": {
+    "default_title": "StarPets Helper — показать или скрыть панель",
+    "default_icon": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png" }
+  },
+  "icons": { "16": "icons/16.png", "32": "icons/32.png", "48": "icons/48.png", "128": "icons/128.png" },
+  "content_scripts": [
+    {
+      "matches": ["*://starpets.gg/*", "*://*.starpets.gg/*", "*://starpets.pw/*", "*://*.starpets.pw/*"],
+      "js": ["hook.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["*://starpets.gg/*", "*://*.starpets.gg/*", "*://starpets.pw/*", "*://*.starpets.pw/*"],
+      "js": ["core.js", "content.js"],
+      "run_at": "document_start"
+    }
+  ]
+}
