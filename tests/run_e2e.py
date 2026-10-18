@@ -47,9 +47,21 @@ def competitor_and_logout(site):
         site.tokens.clear()
 
 
+# по минимальной цене: самый дешёвый чужой лот минус копейка
+EXPECTED_MIN = {"o1": 2.0, "n1": 19.99, "n2": 19.99, "n3": 39.99, "n7": 39.99, "n4": 4.99}
+
+
+def more_own_lots(site):
+    """Перед «снять всё»: у пользователя три лота на новом маркете (n1, n4 и n3)."""
+    site.state["sales"]["own1"] = {"product": "N1", "item": "n1", "price": 30.0, "user": "U1", "account": "acc1"}
+    site.state["sales"]["own4"] = {"product": "N3", "item": "n4", "price": 6.0, "user": "U1", "account": "acc1"}
+
+
 def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="",
-        extra_args=(), during=None, want=None, interval=None):
+        extra_args=(), during=None, want=None, interval=None, setup=None):
     site = MockSite(variant, demo=demo)
+    if setup:
+        setup(site)
     p = site.port
     if variant == "old":
         page, api = f"http://127.0.0.1:{p}", f"http://127.0.0.1:{p}"
@@ -112,7 +124,8 @@ def run(name, variant, transport="auto", dry_run=False, demo=True, expect_text="
     site.stop()
     got = site.my_prices()
     want = want or (EXPECTED_MARKET if variant == "market" else INITIAL if dry_run else EXPECTED)
-    ok = got == want and "Ошибок: 0" in proc.stdout and expect_text in proc.stdout
+    ok = (got == want and ("Ошибок: 0" in proc.stdout or "--cancel-all" in extra_args)
+          and expect_text in proc.stdout)
     if variant == "market":
         # старый маркет закрыт: программа не должна его ни показывать, ни трогать
         ok = ok and "старый маркет" not in proc.stdout.lower()
@@ -137,6 +150,12 @@ if __name__ == "__main__":
             "market/teach", "market", expect_text="Запомнил, как выставлять"),
         "два маркета: по запомненному, без показа": run(
             "market/saved", "market", demo=False, expect_text="как запомнил раньше"),
+        "по минимальной цене": run(
+            "market/min", "market", demo=False, extra_args=("--once", "--min"),
+            want=EXPECTED_MIN, expect_text="минимум на рынке"),
+        "снять всё": run(
+            "market/cancel", "market", demo=False, extra_args=("--cancel-all",),
+            setup=more_own_lots, want={"o1": 2.0}, expect_text="Снято лотов: 3 из 3"),
         "слежение: конкурент сбил цену, граница −20%, сайт разлогинил": run(
             "market/watch", "market", demo=False, extra_args=("--watch", "--passes", "4"),
             during=competitor_and_logout, want=EXPECTED_WATCH, interval=2,

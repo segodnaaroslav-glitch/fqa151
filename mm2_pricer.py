@@ -15,6 +15,12 @@ MM2 Pricer v2 — разовый репрайсер для dreampets.gg (вер�
 
 Никакого цикла: один запуск = одна смена цен.
 
+Что нового в v2.5:
+  * «Снять всё»: пункт меню 5 (или --cancel-all) снимает с продажи все ваши
+    лоты сразу; в режиме слежения то же делает клавиша 0.
+  * «По минимальной цене»: пункты меню 3 и 4 (или --min) ставят цену на
+    копейку ниже самого дешёвого лота вместо 5-го.
+
 Что нового в v2.4:
   * Старый маркет (mm2.dreampets.gg) закрыт — программа его больше не трогает
     (включить обратно: "old_market": true в mm2pricer_config.json).
@@ -73,7 +79,7 @@ for _s in (sys.stdout, sys.stderr):
         pass
 
 
-VERSION = "2.4"
+VERSION = "2.5"
 
 ENDPOINT_KEYS = ("items_api", "profile_api", "sales_api", "sales_user_api", "sales_best_api")
 
@@ -116,8 +122,11 @@ DEFAULT_CONFIG = {
     # сколько ждать, пока вы один раз покажете выставление на новом маркете
     "teach_timeout_s": 900,
 
-    # режим: ask — спросить при запуске, once — один проход, watch — следить постоянно
+    # режим: ask — спросить при запуске, once — один проход, watch — следить постоянно,
+    # cancel — снять с продажи все лоты
     "mode": "ask",
+    # true — ставить по минимальной цене (самый дешёвый лот − undercut) вместо top_n-го
+    "cheapest": False,
     # пауза между проверками рынка в режиме слежения, секунд
     "watch_interval_s": 60,
     # защита от ценовой войны: за один запуск цена товара не опускается ниже,
@@ -314,6 +323,7 @@ def norm_sale(raw) -> dict | None:
         "price": to_price(first(raw, "price", "amount", "cost")),
         "status": str(raw.get("status") or raw.get("state") or "").strip().lower(),
         "user_id": first(raw, "user_id", "userId", "seller_id", "sellerId") or first(seller, "user_id", "id"),
+        "raw": raw,
     }
 
 
@@ -1771,25 +1781,32 @@ def forget_learned(path: str):
         pass
 
 
-def enter_pressed() -> bool:
-    """Нажат ли Enter в окне программы (не блокирует)."""
+def read_key() -> str | None:
+    """Что нажато в окне программы (не блокирует): "enter", "0" или None."""
     try:
         import msvcrt
-        hit = False
+        key = None
         while msvcrt.kbhit():
-            if msvcrt.getwch() in ("\r", "\n"):
-                hit = True
-        return hit
+            ch = msvcrt.getwch()
+            if ch == "0":
+                key = "0"
+            elif ch in ("\r", "\n") and key is None:
+                key = "enter"
+        return key
     except ImportError:
         pass
     try:
         import select
         if sys.stdin and sys.stdin.isatty() and select.select([sys.stdin], [], [], 0)[0]:
-            sys.stdin.readline()
-            return True
+            return "0" if sys.stdin.readline().strip() == "0" else "enter"
     except Exception:
         pass
-    return False
+    return None
+
+
+def enter_pressed() -> bool:
+    """Нажат ли Enter в окне программы (не блокирует)."""
+    return read_key() == "enter"
 
 
 _TEACH_STEPS = (("best", "вижу лоты товара"), ("create", "вижу выставление"), ("cancel", "вижу снятие"))
@@ -2191,7 +2208,7 @@ def reprice_one(market, cfg: dict, pid, name: str, prod_items: list[dict],
 
     peak = prices[-1]
     target, held = apply_floor(target_price(peak, cfg), floor_key, floors, cfg)
-    top = f"{len(prices)}-й в топе {peak:.2f}"
+    top = f"минимум на рынке {peak:.2f}" if top_n == 1 else f"{len(prices)}-й в топе {peak:.2f}"
 
     if len(prev_prices) == count and all(
             p is not None and round(p * 100) == round(target * 100) for p in prev_prices.values()):
@@ -2229,8 +2246,13 @@ def _now() -> str:
     return time.strftime("%H:%M:%S")
 
 
+class CancelAllRequested(Exception):
+    """Во время слежения нажали 0 — снять все лоты и выйти."""
+
+
 def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: dict,
-             first: bool, floors: dict | None, last_reports: dict, number: int):
+             first: bool, floors: dict | None, last_reports: dict, number: int,
+             control: dict | None = None):
     """Одна проверка: инвентарь -> рынок -> перевыставление. Первая — подробно, остальные — только изменения."""
     t0 = time.time()
     items, my_sales, frozen = load_inventory(api, browser, cfg, open_sell_page=first,
@@ -2296,6 +2318,13 @@ def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: 
                               sales_by_item, my_item_ids, my_sale_ids, api.user_id, floors, key)
             futures[fut] = (key, name)
         for fut in as_completed(futures):
+            if control is not None:
+                pressed = read_key()
+                if pressed == "0":
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    raise CancelAllRequested()
+                if pressed == "enter":
+                    control["stop"] = True
             key, name = futures[fut]
             done += 1
             failed = False
@@ -2326,17 +2355,20 @@ def run_pass(api: Api, browser: Browser, cfg: dict, learned_path: str, markets: 
               f"без изменений {total - changed - errors}, ошибок {errors}.")
 
 
-def wait_or_stop(browser: Browser, seconds: float) -> bool:
-    """Пауза между проверками. True — пора остановиться (Enter или закрыли браузер)."""
+def wait_or_stop(browser: Browser, seconds: float) -> str | None:
+    """Пауза между проверками. "stop" — Enter или закрыли браузер, "cancel" — нажали 0."""
     end = time.time() + seconds
     while time.time() < end:
-        if enter_pressed():
-            return True
+        pressed = read_key()
+        if pressed == "0":
+            return "cancel"
+        if pressed == "enter":
+            return "stop"
         if browser.proc and browser.proc.poll() is not None:
             print("Окно браузера закрыто.")
-            return True
+            return "stop"
         time.sleep(0.5)
-    return False
+    return None
 
 
 def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
@@ -2346,12 +2378,17 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
     markets = {"old": OldMarket(api)} if cfg["old_market"] else {}
     floors = {} if watch else None
     last_reports = {}
+    control = {} if watch else None
     number = 0
     while True:
         number += 1
         first = number == 1
         try:
-            run_pass(api, browser, cfg, learned_path, markets, first, floors, last_reports, number)
+            run_pass(api, browser, cfg, learned_path, markets, first, floors, last_reports, number, control)
+        except CancelAllRequested:
+            print(f"\n[{_now()}] Нажали 0 — снимаю с продажи все лоты...")
+            cancel_all(api, browser, cfg, learned_path, markets)
+            return
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -2362,17 +2399,99 @@ def run_pricing(api: Api, browser: Browser, cfg: dict, learned_path: str,
             print(f"[{_now()}] Проверка №{number}: ошибка ({short(e)}) — попробую в следующий раз.")
         if not watch or (max_passes and number >= max_passes):
             return
+        if control.get("stop"):
+            print("Останавливаю слежение.")
+            return
         if first:
             pct = cfg.get("max_drop_percent")
             guard = (f" Ниже −{pct:g}% от первой цены товара не опускаюсь."
                      if pct is not None and pct >= 0 else "")
+            what = ("самый дешёвый лот" if int(cfg["top_n"]) == 1
+                    else f"{int(cfg['top_n'])}-й лот в топе")
             print(f"\nСлежу за рынком: проверяю каждые {cfg['watch_interval_s']:g} с и переставляю, "
-                  f"если 5-й лот в топе изменился.{guard}\n"
-                  f"Показываю только изменения. Чтобы остановить — нажмите Enter (или Ctrl+C).\n")
+                  f"если {what} изменился.{guard}\n"
+                  f"Показываю только изменения.\n"
+                  f"  Enter — остановить слежение (лоты остаются на продаже)\n"
+                  f"  0     — снять с продажи все лоты и выйти\n")
             _log_quiet = True       # дальше в лог — только изменения и ошибки
-        if wait_or_stop(browser, float(cfg["watch_interval_s"])):
+        pressed = wait_or_stop(browser, float(cfg["watch_interval_s"]))
+        if pressed == "cancel":
+            print(f"\n[{_now()}] Нажали 0 — снимаю с продажи все лоты...")
+            cancel_all(api, browser, cfg, learned_path, markets)
+            return
+        if pressed == "stop":
             print("Останавливаю слежение.")
             return
+
+
+def cancel_all(api: Api, browser: Browser, cfg: dict, learned_path: str,
+               markets: dict | None = None, confirm: bool = False):
+    """Снимает с продажи все ваши лоты — параллельно, по одному запросу на лот."""
+    fresh = markets is None
+    items, sales, _ = load_inventory(api, browser, cfg, open_sell_page=fresh,
+                                     use_site_items=fresh, verbose=fresh)
+    if markets is None:
+        markets = {"old": OldMarket(api)} if cfg["old_market"] else {}
+    if any(s["market"] == "new" for s in sales) and "new" not in markets:
+        ops = load_learned(learned_path)
+        if not ops:
+            ops = teach_new_market(api, browser, cfg, [it for it in items if it["market"] == "new"])
+            if ops:
+                ops = relative_to_market(ops, cfg)
+                save_learned(learned_path, ops)
+                items, sales, _ = load_inventory(api, browser, cfg, open_sell_page=False)
+        if ops:
+            markets["new"] = NewMarket(api, ops, cfg, learned_path)
+
+    todo = [s for s in sales if s["market"] in markets]
+    if len(todo) < len(sales):
+        print(f"Не знаю, как снимать на новом маркете — пропускаю {len(sales) - len(todo)} лотов.")
+    if not todo:
+        print("Снимать нечего: ваших лотов на продаже нет.")
+        return
+    by_item = {str(it["item_id"]): it for it in items}
+    jobs = []
+    for sale in todo:
+        item = by_item.get(str(sale["item_id"])) or {
+            "item_id": sale["item_id"], "product_id": sale["product_id"],
+            "name": str(sale["product_id"]), "raw": sale.get("raw") or {}}
+        jobs.append((sale["market"], item, sale))
+
+    print(f"Ваших лотов на продаже: {len(todo)}.")
+    if cfg["dry_run"]:
+        print(f"[ТЕСТ] Снял бы все {len(todo)} лотов.")
+        return
+    if confirm and sys.stdin and sys.stdin.isatty():
+        try:
+            answer = input(f"Снять с продажи все {len(todo)} лотов? Введите «да» и нажмите Enter: ")
+        except Exception:
+            answer = ""
+        if answer.strip().lower() not in ("да", "д", "yes", "y"):
+            print("Отменено — ничего не снимал.")
+            return
+
+    t0 = time.time()
+    done, failed = Counter(), Counter()
+    first_error = {}
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg["workers"]))) as pool:
+        futures = {pool.submit(markets[mk].cancel, [(item, sale)]): (item["name"] + markets[mk].tag)
+                   for mk, item, sale in jobs}
+        for fut in as_completed(futures):
+            name = futures[fut]
+            try:
+                fut.result()
+                done[name] += 1
+            except Exception as e:
+                failed[name] += 1
+                first_error.setdefault(name, short(e))
+                log(f"Снятие {name}: {traceback.format_exc()}")
+    for name in sorted(set(done) | set(failed)):
+        line = f"  {name}: снял {done[name]} шт."
+        if failed[name]:
+            line += f", не снял {failed[name]} ({first_error[name]})"
+        print(line)
+    print(f"\nСнято лотов: {sum(done.values())} из {len(todo)} за {time.time() - t0:.1f} с. "
+          f"Ошибок: {sum(failed.values())}.")
 
 
 def log_diagnostics(browser: Browser, api: Api | None):
@@ -2392,18 +2511,25 @@ def log_diagnostics(browser: Browser, api: Api | None):
         log(f"Ответ API сайту: {cap['method']} {cap['url']} -> {cap['status']}\n  {cap['body'][:3000]}")
 
 
-def ask_mode() -> str:
+def ask_mode(cfg: dict) -> tuple[str, bool]:
+    """Меню при запуске. Возвращает (режим, по минимальной цене)."""
     if not (sys.stdin and sys.stdin.isatty()):
-        return "once"
-    print("Как работать?\n"
-          "  1 — переставить цены один раз и выйти\n"
-          "  2 — следить за рынком и переставлять цены постоянно (пока не остановите)")
+        return "once", False
+    top = f"{int(cfg['top_n'])}-й лот в топе − {cfg['undercut']:.2f}"
+    low = f"самый дешёвый лот − {cfg['undercut']:.2f}"
+    print("Что сделать?\n"
+          f"  1 — переставить цены один раз ({top})\n"
+          f"  2 — следить за рынком и переставлять постоянно ({top})\n"
+          f"  3 — переставить один раз по минимальной цене ({low})\n"
+          f"  4 — следить за рынком по минимальной цене ({low})\n"
+          "  5 — снять с продажи все свои лоты")
     try:
-        answer = input("Введите 1 или 2 и нажмите Enter [2]: ").strip()
+        answer = input("Введите номер и нажмите Enter [2]: ").strip()
     except Exception:
-        return "once"
+        return "once", False
     print()
-    return "once" if answer == "1" else "watch"
+    return {"1": ("once", False), "3": ("once", True), "4": ("watch", True),
+            "5": ("cancel", False)}.get(answer, ("watch", False))
 
 
 def main(argv=None):
@@ -2416,6 +2542,9 @@ def main(argv=None):
     parser.add_argument("--no-pause", action="store_true", help="не ждать Enter в конце")
     parser.add_argument("--watch", action="store_true", help="следить за рынком постоянно")
     parser.add_argument("--once", action="store_true", help="переставить цены один раз и выйти")
+    parser.add_argument("--min", action="store_true",
+                        help="по минимальной цене: самый дешёвый лот на рынке минус копейка")
+    parser.add_argument("--cancel-all", action="store_true", help="снять с продажи все свои лоты")
     parser.add_argument("--passes", type=int, default=0, help=argparse.SUPPRESS)
     args, _ = parser.parse_known_args(argv)
 
@@ -2423,14 +2552,23 @@ def main(argv=None):
     cfg = load_config(args.config)
     if args.dry_run:
         cfg["dry_run"] = True
-    mode = "watch" if args.watch else "once" if args.once else cfg["mode"]
-    if mode not in ("once", "watch"):
-        mode = ask_mode()
-    if mode == "watch":
+    mode = ("cancel" if args.cancel_all else "watch" if args.watch else "once" if args.once
+            else cfg["mode"])
+    cheapest = args.min or bool(cfg["cheapest"])
+    if mode not in ("once", "watch", "cancel"):
+        mode, menu_cheapest = ask_mode(cfg)
+        cheapest = cheapest or menu_cheapest
+    if cheapest:
+        cfg["top_n"] = 1            # «по минимальной цене»: от самого дешёвого лота
+    rule = (f"самый дешёвый лот − {cfg['undercut']:.2f}" if cheapest
+            else f"{int(cfg['top_n'])}-й лот в топе − {cfg['undercut']:.2f}")
+    if mode == "cancel":
+        print("Режим: снять с продажи все ваши лоты.\n")
+    elif mode == "watch":
         print(f"Режим: слежу за рынком и переставляю цены каждые {cfg['watch_interval_s']:g} с, "
-              f"пока не остановите.\n")
+              f"пока не остановите. Цена: {rule}.\n")
     else:
-        print("Режим: один раз — вход -> смена цен -> выход.\n")
+        print(f"Режим: один раз — вход -> смена цен -> выход. Цена: {rule}.\n")
     if cfg["dry_run"]:
         print("ТЕСТОВЫЙ РЕЖИМ: цены не меняются, только показываю, что было бы сделано.\n")
     open_log(args.log)
@@ -2454,7 +2592,10 @@ def main(argv=None):
 
         print(f"Вход подтверждён ({user}).\n")
         api.logged_in = True
-        run_pricing(api, browser, cfg, args.learned, watch=(mode == "watch"), max_passes=args.passes)
+        if mode == "cancel":
+            cancel_all(api, browser, cfg, args.learned, confirm=True)
+        else:
+            run_pricing(api, browser, cfg, args.learned, watch=(mode == "watch"), max_passes=args.passes)
     except KeyboardInterrupt:
         print("\nПрервано.")
     except Exception as e:

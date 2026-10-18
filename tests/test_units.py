@@ -40,8 +40,8 @@ def test_extract_and_normalize():
             {"item_id": "i1", "product_id": "P1", "name": "Knife", "status": "on_sale", "blocked": False}]
     assert m.norm_item({"id": 1, "product_id": 2, "tradable": False})["blocked"] is True
     sale = m.norm_sale({"id": "s1", "item": {"id": "i1"}, "price": {"amount": "12,50"}, "status": "Active"})
-    assert sale == {"sale_id": "s1", "item_id": "i1", "product_id": None, "price": 12.5,
-                    "status": "active", "user_id": None}
+    assert {k: v for k, v in sale.items() if k != "raw"} == {
+        "sale_id": "s1", "item_id": "i1", "product_id": None, "price": 12.5, "status": "active", "user_id": None}
     assert m.sale_active(sale)
     assert not m.sale_active(dict(sale, status="sold"))
     assert m.extract_list({"error": "x"}, "items") is None

@@ -46,6 +46,7 @@
   "market_sales_user_api": "https://mm2-test.dreampets.gg/api/market/v1/users/{user_id}/sales",
   "teach_timeout_s": 900,
   "mode": "ask",
+  "cheapest": false,
   "watch_interval_s": 60,
   "max_drop_percent": 20,
   "dry_run": false,
